@@ -23,6 +23,7 @@
 #define DEFAULT_PORT      4433
 #define CERTIFICATE_FILE  "cert.pem"
 #define KEY_FILE          "key.pem"
+#define DATABASE_NAME     "test_database.db"
 
 /**
 * @brief This function does the basic necessary housekeeping to establish TCP connections
@@ -170,6 +171,108 @@ void configure_context(SSL_CTX* ssl_ctx) {
   }
 }
 
+void exitClientCall(SSL* ssl, int* client, char* client_addr) {
+    printf("Server: Terminating SSL session and TCP connection with client (%s)\n",
+	    client_addr);
+
+    SSL_shutdown(ssl);
+    SSL_free(ssl);
+    close(*client);
+}
+
+bool createDatabaseAndUserTable(sqlite3** db, char* sql, char* err_msg, int* rc) {
+    sql = "CREATE TABLE IF NOT EXISTS Users(Email TEXT, Password TEXT);";
+
+    *rc = sqlite3_open(DATABASE_NAME, db); // Opens and/or creates a database.
+
+    if (*rc) { // Error checking
+        fprintf(stderr, "Failed to open the database: %s\n", sqlite3_errmsg(*db));
+        return false;
+    }
+
+    else {
+        fprintf(stdout, "Opened/created the database successfully\n");
+
+        *rc = sqlite3_exec(*db, sql, 0, 0, &err_msg); // execute the sql statement creating the user table if doesnt exist
+
+        if (*rc != SQLITE_OK) { // Failed executing the statement
+          fprintf(stderr, "SQL error: %s\n", err_msg);
+          sqlite3_free(err_msg);
+          return false;
+        }
+
+        else { // Success executing the sql statement.
+            fprintf(stdout, "User Table created successfully or already exists\n");
+        }
+    }
+
+    return true;
+}
+
+void addUserToDatabase(sqlite3* db, char* sql, char* err_msg, int* rc) {
+    const char *email_to_check = "test@regis.edu";
+    sqlite3_stmt *res; // first statement to use to check if a user is in the users table.
+
+    sql = "SELECT Email FROM Users WHERE Email = ?;";
+
+    *rc = sqlite3_prepare_v2(db, sql, -1, &res, 0);
+
+    if (*rc == SQLITE_OK) { // statement prepared okay, bind the test email to the '?' in the sql statement.
+        sqlite3_bind_text(res, 1, email_to_check, -1, SQLITE_STATIC);
+    }
+
+    else { // Failed to prepare statement
+        fprintf(stderr, "Failed to prepare statement: %s\n", sqlite3_errmsg(db));
+        
+    }
+
+    *rc = sqlite3_step(res); // execute the prepared statement
+
+    if (*rc == SQLITE_ROW) { // User with that email exists
+      fprintf(stdout, "User already exists with email: %s\n", email_to_check);
+    }
+
+    else if (*rc == SQLITE_DONE) { // User doesnt exist, lets add the new user.
+        sql = "INSERT INTO Users (Email, Password) VALUES (?, ?);";
+
+        sqlite3_stmt *insert_stmt; // next statement to use, insert statement.
+
+        *rc = sqlite3_prepare_v2(db, sql, -1, &insert_stmt, 0); // prepare the insert statement
+
+        if (*rc == SQLITE_OK) { // prepared successfully, bind the email and password to the '?' in the insert statement
+          sqlite3_bind_text(insert_stmt, 1, "test@regis.edu", -1, SQLITE_STATIC);
+          sqlite3_bind_text(insert_stmt, 2, "TestP@ss", -1, SQLITE_STATIC);
+        
+          *rc = sqlite3_step(insert_stmt); // execute the insert statement.
+
+          if (*rc == SQLITE_DONE) { // execute statement success.
+            fprintf(stdout, "Test user entered into table successfully\n");
+          }
+
+          else { // execute statement failure
+            fprintf(stderr, "Failed to insert user: %s\n", sqlite3_errmsg(db));
+          }
+        }
+
+        else { // Failed to prepare the statement
+          fprintf(stderr, "Failed to prepare INSERT statement: %s\n", sqlite3_errmsg(db));
+        }
+
+        sqlite3_finalize(insert_stmt); // deallocate resources
+    }
+
+    else { // Failed to execute statement to find user
+        fprintf(stderr, "Error while checking for user: %s\n", sqlite3_errmsg(db));
+    }
+
+    sqlite3_finalize(res); // deallocate resources
+}
+
+bool logInCall() {
+    // Handle the log in loop here, request that the client log in, check their input to the db, and continue until logged in or receive a exit code from client (maybe CLIENT_EXIT)
+    return false;
+}
+
 /**
 @brief The sequence of steps required to establish a secure SSL/TLS connection is:
 *
@@ -191,67 +294,22 @@ int main(int argc, char **argv) {
   unsigned int sockfd;
   unsigned int port;
   char         buffer[BUFFER_SIZE];
-  int rc;
-  char *err_msg = 0;
-  char *sql = "CREATE TABLE IF NOT EXISTS Users(Id INT, Email TEXT, Password TEXT);";
+  int          rc;
+  char         *err_msg = 0;
+  char         *sql;
+  sqlite3      *db;
+  bool         dbAndUserTableCreated;
 
-  sqlite3 *db;
+  if (dbAndUserTableCreated = createDatabaseAndUserTable(&db, sql, err_msg, &rc)) { // Creates/opens database and creates user table if it doesnt exist in the db.
 
-  rc = sqlite3_open("test_database.db", &db);
+    addUserToDatabase(db, sql, err_msg, &rc); // Adds a user to the db if they arent in it already.
+  }
 
-  if (rc) {
-    fprintf(stderr, "Failed to open the database: %s\n", sqlite3_errmsg(db));
+  else {
+    fprintf(stdout, "Server: Failed to create database or user table, exiting now\n");
+
     return EXIT_FAILURE;
   }
-  else {
-    fprintf(stdout, "Opened/created the database successfully\n");
-
-    rc = sqlite3_exec(db, sql, 0, 0, &err_msg);
-
-    if (rc != SQLITE_OK) {
-        fprintf(stderr, "SQL error: %s\n", err_msg);
-        sqlite3_free(err_msg);
-    }
-    else {
-        fprintf(stdout, "User Table created successfully or already exists\n");
-
-        const char *email_to_check = "test@regis.edu";
-        sqlite3_stmt *res;
-
-        sql = "SELECT Email FROM Users WHERE Email = ?;";
-
-        rc = sqlite3_prepare_v2(db, sql, -1, &res, 0);
-
-        if (rc == SQLITE_OK) {
-            sqlite3_bind_text(res, 1, email_to_check, -1, SQLITE_STATIC);
-        }
-        else {
-            fprintf(stderr, "Failed to execute statement: %s\n", sqlite3_errmsg(db));
-            return EXIT_FAILURE;
-        }
-
-        rc = sqlite3_step(res);
-
-        if (rc == SQLITE_ROW) {
-            fprintf(stdout, "User already exists with email: %s\n", email_to_check);
-        }
-        else {
-
-            sql = "INSERT INTO USERS VALUES(1, 'test@regis.edu', 'TestP@ss');";
-
-            rc = sqlite3_exec(db, sql, 0, 0, &err_msg);
-
-            if (rc != SQLITE_OK) {
-                fprintf(stderr, "SQL error: %s\n", err_msg);
-                sqlite3_free(err_msg);
-            }
-            else {
-                fprintf(stdout, "Test user entered into table successfully\n");
-            }
-        }
-    }
-  }
-
 
   signal(SIGPIPE, SIG_IGN);
 
@@ -283,13 +341,6 @@ int main(int argc, char **argv) {
   while(true) {
     SSL*               ssl;
     int                client;
-    int                readfd;
-    int                rcount;
-    int                errorCode;
-    char               operationString[STRING_SIZE];
-    char               fileName[STRING_SIZE];
-    int                initialMessageRead;
-    int                errorMessageSent;
     const  char        reply[] = "Hello World!";
     struct sockaddr_in addr;
     unsigned int       len = sizeof(addr);
@@ -299,7 +350,6 @@ int main(int argc, char **argv) {
     int                initialMessageSent;
     int                logInMessageSent;
     int                messageRead;
-    bool               exitProgram = false;
     char               userName[STRING_SIZE];
     char               userPassword[STRING_SIZE];
 
@@ -352,12 +402,8 @@ int main(int argc, char **argv) {
 
         if ((initialMessageSent = SSL_write(ssl, initialMessage, strlen(initialMessage))) < 0) {
             fprintf(stderr, "Server: Failed to send the initial message to the client, Error: %s\n", strerror(errno));
-            printf("Server: Terminating SSL session and TCP connection with client (%s)\n",
-	              client_addr);
 
-            SSL_shutdown(ssl);
-            SSL_free(ssl);
-            close(client);
+            exitClientCall(ssl, &client, client_addr);
         }
 
         else {
@@ -365,12 +411,8 @@ int main(int argc, char **argv) {
 
             if ((logInMessageSent = SSL_write(ssl, logInMessage, strlen(logInMessage))) < 0) {
                 fprintf(stderr, "Server: Failed to send the log in message to the client, Error: %s\n", strerror(errno));
-                printf("Server: Terminating SSL session and TCP connection with client (%s)\n",
-	                client_addr);
-
-                SSL_shutdown(ssl);
-                SSL_free(ssl);
-                close(client);
+                
+                exitClientCall(ssl, &client, client_addr);
             }
 
             else {
@@ -378,12 +420,8 @@ int main(int argc, char **argv) {
                 bzero(buffer, BUFFER_SIZE);
                 if ((messageRead = SSL_read(ssl, buffer, BUFFER_SIZE)) < 0) {
                     fprintf(stderr, "Server: Failed to send the log in message to the client, Error: %s\n", strerror(errno));
-                    printf("Server: Terminating SSL session and TCP connection with client (%s)\n",
-	                    client_addr);
-
-                    SSL_shutdown(ssl);
-                    SSL_free(ssl);
-                    close(client);
+                    
+                    exitClientCall(ssl, &client, client_addr);
                 }
 
                 else {
@@ -394,12 +432,7 @@ int main(int argc, char **argv) {
         }
 
         // Terminate the SSL session, close the TCP connection, and clean up
-        printf("Server: Terminating SSL session and TCP connection with client (%s)\n",
-	        client_addr);
-
-        SSL_shutdown(ssl);
-        SSL_free(ssl);
-        close(client);
+        exitClientCall(ssl, &client, client_addr);
     }
   }
 

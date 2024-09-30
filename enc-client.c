@@ -30,7 +30,7 @@
 #define DEFAULT_HOST        "localhost"
 #define MAX_HOSTNAME_LENGTH 256
 #define BUFFER_SIZE         256
-#define FILE_NAME_SIZE      50
+#define STRING_NAME         50
 
 /**
 * @brief This function does the basic necessary housekeeping to establish a secure TCP
@@ -84,6 +84,21 @@ int create_socket(char* hostname, unsigned int port) {
   return sockfd;
 }
 
+void logInCall() {
+    // if the LOG_IN message is received, call this function to loop, read and write until logged in or exit.
+}
+
+int exitFailureCall(SSL* ssl, SSL_CTX* ssl_ctx, int* sockfd, char* remote_host) {
+    printf("Client: Terminating SSL session and TCP connection with server (%s)\n",
+	    remote_host);
+    SSL_CTX_free(ssl_ctx);
+    SSL_shutdown(ssl);
+    SSL_free(ssl);
+    close(*sockfd);
+
+    return EXIT_FAILURE;
+}
+
 
 /**
 * @brief The sequence of steps required to establish a secure SSL/TLS connection is:
@@ -105,28 +120,16 @@ int main(int argc, char** argv) {
   unsigned int      port = DEFAULT_PORT;
   char              remote_host[MAX_HOSTNAME_LENGTH];
   char              buffer[BUFFER_SIZE];
-  char              messageToSend[BUFFER_SIZE];
-  char              fileName[FILE_NAME_SIZE];
   char*             temp_ptr;
   int               sockfd;
-  int               writefd;
-  int               bytesRead;
-  int               rcount;
-  int               wcount;
-  int               fileNameSent;
   int               total = 0;
-  char              errorFoundMessage[FILE_NAME_SIZE];
-  char              newFileToOpenOrCreate[FILE_NAME_SIZE];
-  bool              errorFound;
-  bool              writeToFileBool;
   int               messageRead;
   int               messageSent;
   SSL_CTX*          ssl_ctx;
   SSL*              ssl;
-  bool              exitClient = false;
-  char              userResponse[FILE_NAME_SIZE];
-  char              userName[FILE_NAME_SIZE];
-  char              userPassword[FILE_NAME_SIZE];
+  char              userResponse[STRING_NAME];
+  char              userName[STRING_NAME];
+  char              userPassword[STRING_NAME];
 
   if (argc != 2) {
     fprintf(stderr, "Client: Usage: ssl-client <server name>:<port>\n");
@@ -209,14 +212,8 @@ int main(int argc, char** argv) {
 
     if ((messageRead = SSL_read(ssl, buffer, BUFFER_SIZE)) < 0) {
         fprintf(stderr, "Client: Failed to read the message from the server, Error: %s\n", strerror(errno));
-        printf("Client: Terminating SSL session and TCP connection with server (%s)\n",
-	              remote_host);
-        SSL_CTX_free(ssl_ctx);
-        SSL_shutdown(ssl);
-        SSL_free(ssl);
-        close(sockfd);
 
-        return EXIT_FAILURE;
+        return exitFailureCall(ssl, ssl_ctx, &sockfd, remote_host);
     }
 
     else {
@@ -227,14 +224,8 @@ int main(int argc, char** argv) {
 
         if ((messageRead = SSL_read(ssl, buffer, BUFFER_SIZE)) < 0) {
             fprintf(stderr, "Client: Failed to read the message from the server, Error: %s\n", strerror(errno));
-            printf("Client: Terminating SSL session and TCP connection with server (%s)\n",
-	              remote_host);
-            SSL_CTX_free(ssl_ctx);
-            SSL_shutdown(ssl);
-            SSL_free(ssl);
-            close(sockfd);
 
-            return EXIT_FAILURE;
+            return exitFailureCall(ssl, ssl_ctx, &sockfd, remote_host);
         }
         else {
             fprintf(stdout, "Client: Message Received, message: %s\n", buffer);
@@ -242,10 +233,10 @@ int main(int argc, char** argv) {
             if ((strcmp(buffer, "LOG_IN")) == 0) {
                 printf("Client: Please sign in:\n");
                 printf("Client: Username (email): ");
-                fgets(userName, FILE_NAME_SIZE-1, stdin);
+                fgets(userName, STRING_NAME-1, stdin);
                 userName[strlen(userName)-1] = '\0';
                 printf("Client: Password: ");
-                fgets(userPassword, FILE_NAME_SIZE-1, stdin);
+                fgets(userPassword, STRING_NAME-1, stdin);
                 userPassword[strlen(userPassword)-1] = '\0';
 
                 bzero(buffer, BUFFER_SIZE);
@@ -253,14 +244,8 @@ int main(int argc, char** argv) {
 
                 if ((messageSent = SSL_write(ssl, buffer, strlen(buffer))) < 0) {
                     fprintf(stderr, "Client: Failed to send the message to the server, Error: %s\n", strerror(errno));
-                    printf("Client: Terminating SSL session and TCP connection with server (%s)\n",
-	                    remote_host);
-                    SSL_CTX_free(ssl_ctx);
-                    SSL_shutdown(ssl);
-                    SSL_free(ssl);
-                    close(sockfd);
-
-                    return EXIT_FAILURE;
+                    
+                    return exitFailureCall(ssl, ssl_ctx, &sockfd, remote_host);
                 }
 
                 else {
