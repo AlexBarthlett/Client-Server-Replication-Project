@@ -197,6 +197,56 @@ int main(int argc, char** argv) {
 
         if (strcmp(query, "quit") == 0) break;
 
+        if (strcmp(query, "Add_user") == 0) {
+            char username[STRING_SIZE];
+            char password[STRING_SIZE];
+            char role[STRING_SIZE];
+
+            printf("Enter the new username: ");
+            fgets(username, sizeof(username), stdin);
+            username[strcspn(username, "\n")] = 0;
+
+            printf("Enter a new password: ");
+            fgets(password, sizeof(password), stdin);
+            password[strcspn(password, "\n")] = 0;
+
+            printf("Enter a new user role (admin or none): ");
+            fgets(role, sizeof(role), stdin);
+            role[strcspn(role, "\n")] = 0;
+
+            sprintf(query, "%s %s %s %s", "Add_user", username, password, role);
+        }
+        else if (strcmp(query, "Add_product") == 0) {
+            char product_name[STRING_SIZE];
+            char product_category[STRING_SIZE];
+            char temp_buffer[STRING_SIZE];
+            int product_quantity;
+            double product_price;
+
+            printf("Enter the new product's name: ");
+            fgets(product_name, sizeof(product_name), stdin);
+            product_name[strcspn(product_name, "\n")] = 0;
+
+            printf("Enter the new product's category: ");
+            fgets(product_category, sizeof(product_category), stdin);
+            product_category[strcspn(product_category, "\n")] = 0;
+
+            printf("Enter the new product's quantity: ");
+            fgets(temp_buffer, sizeof(temp_buffer), stdin);
+            temp_buffer[strcspn(temp_buffer, "\n")] = 0;
+            product_quantity = atoi(temp_buffer);
+
+            bzero(temp_buffer, STRING_SIZE);
+
+            printf("Enter the new product's price: ");
+            fgets(temp_buffer, sizeof(temp_buffer), stdin);
+            temp_buffer[strcspn(temp_buffer, "\n")] = 0;
+            product_price = atof(temp_buffer);
+
+            sprintf(query, "%s %s %s %d %le", "Add_product", product_name, product_category, product_quantity, product_price);
+        }
+        // TODO, continue if-else statements for each query.  Best to do after the function and parameters are done for the server.
+
         // Send query to server
         SSL_write(ssl, query, strlen(query));
 
