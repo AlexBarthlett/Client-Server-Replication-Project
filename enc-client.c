@@ -30,7 +30,7 @@
 #define DEFAULT_PORT        4433
 #define DEFAULT_HOST        "localhost"
 #define MAX_HOSTNAME_LENGTH 256
-#define BUFFER_SIZE         256
+#define BUFFER_SIZE         1024  // Increased to handle longer responses
 #define STRING_SIZE         50
 
 // Function prototypes
@@ -83,6 +83,10 @@ bool authenticate(SSL* ssl) {
     
     // Receive authentication request from server
     bytes = SSL_read(ssl, buffer, sizeof(buffer));
+    if (bytes <= 0) {
+        fprintf(stderr, "Error receiving authentication request\n");
+        return false;
+    }
     buffer[bytes] = 0;
     printf("Server: %s\n", buffer);
     
@@ -102,6 +106,10 @@ bool authenticate(SSL* ssl) {
     
     // Receive authentication result
     bytes = SSL_read(ssl, buffer, sizeof(buffer));
+    if (bytes <= 0) {
+        fprintf(stderr, "Error receiving authentication result\n");
+        return false;
+    }
     buffer[bytes] = 0;
     printf("Server: %s\n", buffer);
     
@@ -197,13 +205,129 @@ int main(int argc, char** argv) {
 
         if (strcmp(query, "quit") == 0) break;
 
+        if (strcmp(query, "Add_user") == 0) {
+            char username[STRING_SIZE];
+            char password[STRING_SIZE];
+            char role[STRING_SIZE];
+
+            printf("Enter the new username: ");
+            fgets(username, sizeof(username), stdin);
+            username[strcspn(username, "\n")] = 0;
+
+            printf("Enter a new password: ");
+            fgets(password, sizeof(password), stdin);
+            password[strcspn(password, "\n")] = 0;
+
+            printf("Enter a new user role (admin or none): ");
+            fgets(role, sizeof(role), stdin);
+            role[strcspn(role, "\n")] = 0;
+
+            sprintf(query, "%s %s %s %s", "Add_user", username, password, role);
+        }
+        else if (strcmp(query, "Delete_user") == 0) {
+            char username[STRING_SIZE];
+            printf("Enter the username to delete: ");
+            fgets(username, sizeof(username), stdin);
+            username[strcspn(username, "\n")] = 0;
+
+            sprintf(query, "%s %s", "Delete_user", username);
+        }
+        else if (strcmp(query, "View_user") == 0) {
+            char username[STRING_SIZE];
+            printf("Enter the username to view: ");
+            fgets(username, sizeof(username), stdin);
+            username[strcspn(username, "\n")] = 0;
+
+            sprintf(query, "%s %s", "View_user", username);
+        }
+        else if (strcmp(query, "View_all_users") == 0) {
+            // No additional input needed
+        }
+        else if (strcmp(query, "Add_product") == 0) {
+            char product_name[STRING_SIZE];
+            char product_category[STRING_SIZE];
+            char temp_buffer[STRING_SIZE];
+            int product_quantity;
+            double product_price;
+
+            printf("Enter the new product's name: ");
+            fgets(product_name, sizeof(product_name), stdin);
+            product_name[strcspn(product_name, "\n")] = 0;
+
+            printf("Enter the new product's category: ");
+            fgets(product_category, sizeof(product_category), stdin);
+            product_category[strcspn(product_category, "\n")] = 0;
+
+            printf("Enter the new product's quantity: ");
+            fgets(temp_buffer, sizeof(temp_buffer), stdin);
+            temp_buffer[strcspn(temp_buffer, "\n")] = 0;
+            product_quantity = atoi(temp_buffer);
+
+            printf("Enter the new product's price: ");
+            fgets(temp_buffer, sizeof(temp_buffer), stdin);
+            temp_buffer[strcspn(temp_buffer, "\n")] = 0;
+            product_price = atof(temp_buffer);
+
+            sprintf(query, "%s %s %s %d %f", "Add_product", product_name, product_category, product_quantity, product_price);
+        }
+        else if (strcmp(query, "Update_product") == 0) {
+            char product_name[STRING_SIZE];
+            char product_category[STRING_SIZE];
+            char temp_buffer[STRING_SIZE];
+            int product_quantity;
+            double product_price;
+
+            printf("Enter the product's name to update: ");
+            fgets(product_name, sizeof(product_name), stdin);
+            product_name[strcspn(product_name, "\n")] = 0;
+
+            printf("Enter the new category: ");
+            fgets(product_category, sizeof(product_category), stdin);
+            product_category[strcspn(product_category, "\n")] = 0;
+
+            printf("Enter the new quantity: ");
+            fgets(temp_buffer, sizeof(temp_buffer), stdin);
+            temp_buffer[strcspn(temp_buffer, "\n")] = 0;
+            product_quantity = atoi(temp_buffer);
+
+            printf("Enter the new price: ");
+            fgets(temp_buffer, sizeof(temp_buffer), stdin);
+            temp_buffer[strcspn(temp_buffer, "\n")] = 0;
+            product_price = atof(temp_buffer);
+
+            sprintf(query, "%s %s %s %d %f", "Update_product", product_name, product_category, product_quantity, product_price);
+        }
+        else if (strcmp(query, "Delete_product") == 0) {
+            char product_name[STRING_SIZE];
+            printf("Enter the product name to delete: ");
+            fgets(product_name, sizeof(product_name), stdin);
+            product_name[strcspn(product_name, "\n")] = 0;
+
+            sprintf(query, "%s %s", "Delete_product", product_name);
+        }
+        else if (strcmp(query, "View_product") == 0) {
+            char product_name[STRING_SIZE];
+            printf("Enter the product name to view: ");
+            fgets(product_name, sizeof(product_name), stdin);
+            product_name[strcspn(product_name, "\n")] = 0;
+
+            sprintf(query, "%s %s", "View_product", product_name);
+        }
+        else if (strcmp(query, "View_all_products") == 0) {
+            // No additional input needed
+        }
+
         // Send query to server
         SSL_write(ssl, query, strlen(query));
 
         // Receive and display server response
         int bytes = SSL_read(ssl, buffer, sizeof(buffer));
-        buffer[bytes] = 0;
-        printf("Server response: %s\n", buffer);
+        if (bytes > 0) {
+            buffer[bytes] = 0;
+            printf("Server response: %s\n", buffer);
+        } else {
+            fprintf(stderr, "Error receiving server response\n");
+        }
     }
 
     // Clean up
