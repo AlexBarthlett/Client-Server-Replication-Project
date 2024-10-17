@@ -4,6 +4,7 @@
 * @date  ** Due: October 20, 2024 **
 * @brief  fill in here
 */
+
 #include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
@@ -21,7 +22,7 @@
 #include <sqlite3.h>
 
 // Constants for server configuration
-#define BUFFER_SIZE       256
+#define BUFFER_SIZE       1024
 #define STRING_SIZE       50
 #define DEFAULT_PORT      4433
 #define CERTIFICATE_FILE  "cert.pem"
@@ -30,6 +31,8 @@
 #define REPLICA_DB_NAME   "replica_database.db"
 #define REPLICA_SERVER    "localhost"
 #define REPLICA_PORT      5433
+#define ADMIN_USERNAME    "test@regis.edu"
+#define ADMIN_PASSWORD    "TestP@ss"
 
 // Configuration structure for server settings
 typedef struct {
@@ -46,8 +49,136 @@ void cleanup_openssl();
 SSL_CTX* create_new_context();
 void configure_context(SSL_CTX* ssl_ctx);
 void* replication_thread(void* arg);
-bool authenticate_client(SSL* ssl);
+bool authenticate_client(SSL* ssl, char** user_role);
 void handle_client(SSL* ssl, int client, char* client_addr);
+bool create_database();
+bool add_user_query(char* username, char* password, char* new_role);
+bool add_product_query(char* product_name, char* product_category, int product_quantity, double product_price);
+bool login_query(char* username, char* password, char** user_role);
+
+/**
+ * This method converts a SHA256 binary hash into a hexidecimal string for readability.
+ */
+void sha256_hash_string(unsigned char hash[SHA256_DIGEST_LENGTH], char outputBuffer[65]) {
+    int i;
+    for (i = 0; i < SHA256_DIGEST_LENGTH; i++) {
+        sprintf(outputBuffer + (i * 2), "%02x", hash[i]);
+    }
+    outputBuffer[64] = 0;
+}
+
+/**
+ * Converts a string representing a password, into a SHA256 binary string for encryption.
+ */
+void hash_password(const char *password, unsigned char *hash_output) {
+    EVP_MD_CTX *mdctx;
+    const EVP_MD *md;
+    unsigned int hash_length;
+
+    mdctx = EVP_MD_CTX_new();
+    md = EVP_sha256();
+
+    EVP_DigestInit_ex(mdctx, md, NULL);
+    EVP_DigestUpdate(mdctx, password, strlen(password));
+    EVP_DigestFinal_ex(mdctx, hash_output, &hash_length);
+
+    EVP_MD_CTX_free(mdctx);
+}
+
+/**
+ * Creates the main database, creates a user table if it doesnt exist, and creates a product table if it doesnt exist.  
+ * Also adds the initial admin user to the user table if it doesnt exist.
+ */
+bool create_database() {
+    const char *create_table_sql = "CREATE TABLE IF NOT EXISTS Users(Username TEXT NOT NULL UNIQUE PRIMARY KEY, Password TEXT NOT NULL, Role Text NOT NULL);";
+    const char *create_product_table_sql = "CREATE TABLE IF NOT EXISTS Products(ProductID INTEGER PRIMARY KEY AUTOINCREMENT, ProductName TEXT NOT NULL, Category TEXT NOT NULL, Quantity INTEGER NOT NULL, Price REAL NOT NULL);";
+    const char *check_admin_sql = "SELECT COUNT(*) FROM Users WHERE Username=?;";
+
+    sqlite3 *main_db;
+    sqlite3_stmt *stmt;
+    char *err_msg = 0;
+    int dbResult;
+
+    dbResult = sqlite3_open(DATABASE_NAME, &main_db);
+
+    if (dbResult != SQLITE_OK) {
+        fprintf(stderr, "Failed to open main database: %s\n", sqlite3_errmsg(main_db));
+        sqlite3_close(main_db);
+        return false;
+    }
+    
+    dbResult = sqlite3_exec(main_db, create_table_sql, 0, 0, &err_msg);
+
+    if (dbResult != SQLITE_OK) {
+        fprintf(stderr,"SQL error: %s\n", err_msg);
+        sqlite3_free(err_msg);
+        sqlite3_close(main_db);
+        return false;
+    }
+
+    dbResult = sqlite3_exec(main_db, create_product_table_sql, 0, 0, &err_msg);
+
+    if (dbResult != SQLITE_OK) {
+        fprintf(stderr,"SQL error: %s\n", err_msg);
+        sqlite3_free(err_msg);
+        sqlite3_close(main_db);
+        return false;
+    }
+    
+    printf("Users table checked/created successfully.\n");
+    printf("Products table checked/created successfully.\n");
+
+    dbResult = sqlite3_prepare_v2(main_db, check_admin_sql, -1, &stmt, 0);
+
+    if (dbResult != SQLITE_OK) {
+        fprintf(stderr, "Failed to prepare statement: %s\n", sqlite3_errmsg(main_db));
+        sqlite3_close(main_db);
+        return false;
+    }
+
+    sqlite3_bind_text(stmt, 1, ADMIN_USERNAME, -1, SQLITE_STATIC);
+
+    dbResult = sqlite3_step(stmt);
+    int admin_exists = sqlite3_column_int(stmt, 0);
+    sqlite3_finalize(stmt);
+
+    if (admin_exists == 0) {
+        unsigned char hash[SHA256_DIGEST_LENGTH];
+        char hash_string[SHA256_DIGEST_LENGTH * 2 + 1];
+
+        hash_password(ADMIN_PASSWORD, hash);
+        sha256_hash_string(hash, hash_string);
+
+        const char *insert_admin_sql = "INSERT INTO Users (Username, Password, Role) VALUES (?, ?, 'admin');";
+
+        dbResult = sqlite3_prepare_v2(main_db, insert_admin_sql, -1, &stmt, 0);
+
+        if (dbResult != SQLITE_OK) {
+            fprintf(stderr, "Failed to prepare insert statement: %s\n", sqlite3_errmsg(main_db));
+            sqlite3_close(main_db);
+            return false;
+        }
+
+        sqlite3_bind_text(stmt, 1, ADMIN_USERNAME, -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt, 2, hash_string, -1, SQLITE_STATIC);
+        dbResult = sqlite3_step(stmt);
+
+        if (dbResult != SQLITE_DONE) {
+            fprintf(stderr, "Failed to insert admin user: %s\n", sqlite3_errmsg(main_db));
+        }
+        else {
+            printf("Admin user created successfully with hashed password.\n");
+        }
+
+        sqlite3_finalize(stmt);
+    }
+    else {
+        printf("Admin user already exists.\n");
+    }
+
+    sqlite3_close(main_db);
+    return true;
+}
 
 /**
  * Creates a socket and binds it to the specified port.
@@ -56,25 +187,21 @@ int create_socket(unsigned int port) {
     int s;
     struct sockaddr_in addr;
 
-    // Create a socket for IPv4 and TCP protocol
     s = socket(AF_INET, SOCK_STREAM, 0);
     if (s < 0) {
         fprintf(stderr, "Server: Unable to create socket: %s", strerror(errno));
         exit(EXIT_FAILURE);
     }
 
-    // Prepare the sockaddr_in structure
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
 
-    // Bind the socket to the port
     if (bind(s, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
         fprintf(stderr, "Server: Unable to bind to socket: %s", strerror(errno));
         exit(EXIT_FAILURE);
     }
 
-    // Start listening for incoming connections
     if (listen(s, 1) < 0) {
         fprintf(stderr, "Server: Unable to listen: %s", strerror(errno));
         exit(EXIT_FAILURE);
@@ -144,7 +271,6 @@ void* replication_thread(void* arg) {
     while (1) {
         sleep(config.replication_interval);
         
-        // Open main and replica databases
         sqlite3 *main_db, *replica_db;
         char *err_msg = 0;
         
@@ -159,21 +285,18 @@ void* replication_thread(void* arg) {
             continue;
         }
         
-        // Perform the backup
         sqlite3_backup *backup = sqlite3_backup_init(replica_db, "main", main_db, "main");
         if (backup) {
             sqlite3_backup_step(backup, -1);
             sqlite3_backup_finish(backup);
         }
         
-        // Check for errors
         if (sqlite3_errcode(replica_db) != SQLITE_OK) {
             fprintf(stderr, "Replication failed: %s\n", sqlite3_errmsg(replica_db));
         } else {
             printf("Database replicated successfully.\n");
         }
         
-        // Close databases
         sqlite3_close(main_db);
         sqlite3_close(replica_db);
     }
@@ -181,29 +304,176 @@ void* replication_thread(void* arg) {
 }
 
 /**
+ * Function to add a new user to the SQLite database.
+ */
+bool add_user_query(char* username, char* password, char* new_role) {
+    sqlite3 *main_db;
+    sqlite3_stmt *stmt;
+    int dbResult;
+
+    dbResult = sqlite3_open(DATABASE_NAME, &main_db);
+
+    if (dbResult != SQLITE_OK) {
+        fprintf(stderr, "Failed to open database: %s\n", sqlite3_errmsg(main_db));
+        return false;
+    }
+
+    const char *add_new_user_sql = "INSERT INTO Users (Username, Password, Role) VALUES (?, ?, ?);";
+
+    unsigned char hash[SHA256_DIGEST_LENGTH];
+    char hash_string[SHA256_DIGEST_LENGTH *2 +1];
+    hash_password(password, hash);
+    sha256_hash_string(hash, hash_string);
+
+    dbResult = sqlite3_prepare_v2(main_db, add_new_user_sql, -1, &stmt, 0);
+
+    if (dbResult != SQLITE_OK) {
+        fprintf(stderr, "Failed to prepare statement: %s\n", sqlite3_errmsg(main_db));
+        sqlite3_close(main_db);
+        return false;
+    }
+
+    sqlite3_bind_text(stmt, 1, username, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, hash_string, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 3, new_role, -1, SQLITE_STATIC);
+
+    dbResult = sqlite3_step(stmt);
+
+    if (dbResult != SQLITE_DONE) {
+        fprintf(stderr, "Failed to add new user: %s\n", sqlite3_errmsg(main_db));
+        sqlite3_finalize(stmt);
+        sqlite3_close(main_db);
+        return false;
+    }
+
+    sqlite3_finalize(stmt);
+    sqlite3_close(main_db);
+
+    printf("User added successfully.\n");
+    return true;
+}
+
+/**
+ * This function adds a new product to the product table in the SQLite database.
+ */
+bool add_product_query(char* product_name, char* product_category, int product_quantity, double product_price) {
+    sqlite3 *main_db;
+    sqlite3_stmt *stmt;
+    int dbResult;
+
+    dbResult = sqlite3_open(DATABASE_NAME, &main_db);
+
+    if (dbResult != SQLITE_OK) {
+        fprintf(stderr, "Failed to open database: %s\n", sqlite3_errmsg(main_db));
+        return false;
+    }
+
+    const char *add_new_product_sql = "INSERT INTO Products (ProductName, Category, Quantity, Price) VALUES (?, ?, ?, ?);";
+
+    dbResult = sqlite3_prepare_v2(main_db, add_new_product_sql, -1, &stmt, 0);
+
+    if (dbResult != SQLITE_OK) {
+        fprintf(stderr, "Failed to prepare statement: %s\n", sqlite3_errmsg(main_db));
+        sqlite3_close(main_db);
+        return false;
+    }
+
+    sqlite3_bind_text(stmt, 1, product_name, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, product_category, -1, SQLITE_STATIC);
+    sqlite3_bind_int(stmt, 3, product_quantity);
+    sqlite3_bind_double(stmt, 4, product_price);
+
+    dbResult = sqlite3_step(stmt);
+
+    if (dbResult != SQLITE_DONE) {
+        fprintf(stderr, "Failed to add new product: %s\n", sqlite3_errmsg(main_db));
+        sqlite3_finalize(stmt);
+        sqlite3_close(main_db);
+        return false;
+}
+
+    sqlite3_finalize(stmt);
+    sqlite3_close(main_db);
+
+    printf("Product added successfully.\n");
+    return true;
+}
+
+/**
+ * This function checks to see if a user exists with the correct password and if so, 
+ * changes a variable to represent the correct user role such as if they are a system admin, and return if logging in was successful.
+ */
+bool login_query(char* username, char* password, char** user_role) {
+    sqlite3 *main_db;
+    sqlite3_stmt *stmt;
+    int dbResult;
+
+    dbResult = sqlite3_open(DATABASE_NAME, &main_db);
+
+    if (dbResult != SQLITE_OK) {
+        fprintf(stderr, "Failed to open database: %s\n", sqlite3_errmsg(main_db));
+        return false;
+    }
+
+    const char *get_user_sql = "SELECT Password, Role FROM Users WHERE Username = ?;";
+
+    dbResult = sqlite3_prepare_v2(main_db, get_user_sql, -1, &stmt, 0);
+
+    if (dbResult != SQLITE_OK) {
+        fprintf(stderr, "Failed to prepare statement: %s\n", sqlite3_errmsg(main_db));
+        sqlite3_close(main_db);
+        return false;
+    }
+
+    sqlite3_bind_text(stmt, 1, username, -1, SQLITE_STATIC);
+
+    dbResult = sqlite3_step(stmt);
+
+    if (dbResult == SQLITE_ROW) {
+        const char *stored_hash = (const char *)sqlite3_column_text(stmt, 0);
+        const char *role = (const char *)sqlite3_column_text(stmt, 1);
+
+        unsigned char hash[SHA256_DIGEST_LENGTH];
+        char hash_string[SHA256_DIGEST_LENGTH * 2 + 1];
+        hash_password(password, hash);
+        sha256_hash_string(hash, hash_string);
+
+        if (strcmp(stored_hash, hash_string) == 0) {
+            *user_role = strdup(role);
+            sqlite3_finalize(stmt);
+            sqlite3_close(main_db);
+            return true;
+        }
+        else {
+            printf("Authentication failed: Invalid password.\n");
+        }
+    }
+    else {
+        printf("Authentication failed: Username not found.\n");
+    }
+
+    sqlite3_finalize(stmt);
+    sqlite3_close(main_db);
+    return false;
+}
+
+/**
  * Authenticates a client connection.
  */
-bool authenticate_client(SSL* ssl) {
+bool authenticate_client(SSL* ssl, char** user_role) {
     char buffer[BUFFER_SIZE];
     int bytes;
     
-    // Send authentication request
     const char* auth_request = "Please provide your username and password.";
     SSL_write(ssl, auth_request, strlen(auth_request));
     
-    // Receive credentials
     bytes = SSL_read(ssl, buffer, sizeof(buffer));
     buffer[bytes] = 0;
     
     char username[STRING_SIZE], password[STRING_SIZE];
     sscanf(buffer, "%s %s", username, password);
-    
-    // TODO: Implement proper authentication logic
-    // For demonstration, we're using a simple hardcoded check
-    if (strcmp(username, "admin") == 0 && strcmp(password, "password") == 0) {
-        return true;
-    }
-    return false;
+
+    return login_query(username, password, user_role);
 }
 
 /**
@@ -212,30 +482,354 @@ bool authenticate_client(SSL* ssl) {
 void handle_client(SSL* ssl, int client, char* client_addr) {
     char buffer[BUFFER_SIZE];
     int bytes;
+    char* user_role = NULL;
     
-    // Authenticate the client
-    if (!authenticate_client(ssl)) {
+    if (!authenticate_client(ssl, &user_role)) {
         const char* auth_failed = "Authentication failed. Closing connection.";
         SSL_write(ssl, auth_failed, strlen(auth_failed));
         return;
     }
     
-    // Inform client of successful authentication
-    const char* auth_success = "Authentication successful. You can now send queries.";
+    char* auth_success;
+    if (strcmp(user_role, "admin") == 0) {
+        auth_success = "Authentication successful. You can now send queries.\n"
+                                    "1: Update_product\n"
+                                    "2: Add_product\n"
+                                    "3: Delete_product\n"
+                                    "4: View_product\n"
+                                    "5: View_all_products\n"
+                                    "6: Add_User\n"
+                                    "7: Delete_user\n"
+                                    "8: View_User\n"
+                                    "9: View_all_users\n";
+    }
+    else {
+        auth_success = "Authentication successful. You can now send queries.\n"
+                                    "1: Update_product\n"
+                                    "2: Add_product\n"
+                                    "3: Delete_product\n"
+                                    "4: View_product\n"
+                                    "5: View_all_products\n";                               
+    }
+
     SSL_write(ssl, auth_success, strlen(auth_success));
     
-    // Main communication loop
     while (1) {
         bytes = SSL_read(ssl, buffer, sizeof(buffer));
         if (bytes <= 0) break;
         buffer[bytes] = 0;
-        
-        // TODO: Implement query handling logic here
-        // For demonstration, we're just echoing the query back
-        char response[BUFFER_SIZE + 32];
-        snprintf(response, sizeof(response), "Received query: %s", buffer);
+        char response[BUFFER_SIZE];
+
+        char query_requested[STRING_SIZE];
+
+        sscanf(buffer, "%s", query_requested);
+
+        if (strcmp(query_requested, "Add_user") == 0) {
+            char username[STRING_SIZE];
+            char password[STRING_SIZE];
+            char role[STRING_SIZE];
+
+            sscanf(buffer, "%s %s %s %s", query_requested, username, password, role);
+            bool added_new_user = add_user_query(username, password, role);
+
+            if (added_new_user) {
+                strcpy(response, "Added the new user successfully\n");
+            }
+            else {
+                strcpy(response, "Failed to add the new user\n");
+            }
+        }
+        else if (strcmp(query_requested, "Delete_user") == 0) {
+            char username[STRING_SIZE];
+            sscanf(buffer, "%s %s", query_requested, username);
+            
+            sqlite3 *main_db;
+            sqlite3_stmt *stmt;
+            int dbResult;
+            
+            dbResult = sqlite3_open(DATABASE_NAME, &main_db);
+            if (dbResult != SQLITE_OK) {
+                strcpy(response, "Failed to open database");
+            } else {
+                const char *delete_user_sql = "DELETE FROM Users WHERE Username = ?;";
+                dbResult = sqlite3_prepare_v2(main_db, delete_user_sql, -1, &stmt, 0);
+                
+                if (dbResult != SQLITE_OK) {
+                    strcpy(response, "Failed to prepare statement");
+                } else {
+                    sqlite3_bind_text(stmt, 1, username, -1, SQLITE_STATIC);
+                    dbResult = sqlite3_step(stmt);
+                    
+                    if (dbResult == SQLITE_DONE) {
+                        if (sqlite3_changes(main_db) > 0) {
+                            strcpy(response, "User deleted successfully");
+                        } else {
+                            strcpy(response, "User not found");
+                        }
+                    } else {
+                        strcpy(response, "Failed to delete user");
+                    }
+                    
+                    sqlite3_finalize(stmt);
+                }
+                
+                sqlite3_close(main_db);
+            }
+        }
+        else if (strcmp(query_requested, "View_user") == 0) {
+            char username[STRING_SIZE];
+            sscanf(buffer, "%s %s", query_requested, username);
+            
+            sqlite3 *main_db;
+            sqlite3_stmt *stmt;
+            int dbResult;
+            
+            dbResult = sqlite3_open(DATABASE_NAME, &main_db);
+            if (dbResult != SQLITE_OK) {
+                strcpy(response, "Failed to open database");
+            } else {
+                const char *view_user_sql = "SELECT Username, Role FROM Users WHERE Username = ?;";
+                dbResult = sqlite3_prepare_v2(main_db, view_user_sql, -1, &stmt, 0);
+                
+                if (dbResult != SQLITE_OK) {
+                    strcpy(response, "Failed to prepare statement");
+                } else {
+                    sqlite3_bind_text(stmt, 1, username, -1, SQLITE_STATIC);
+                    dbResult = sqlite3_step(stmt);
+                    
+                    if (dbResult == SQLITE_ROW) {
+                        const char *user = (const char *)sqlite3_column_text(stmt, 0);
+                        const char *role = (const char *)sqlite3_column_text(stmt, 1);
+                        snprintf(response, BUFFER_SIZE, "Username: %s, Role: %s", user, role);
+                    } else {
+                        strcpy(response, "User not found");
+                    }
+                    
+                    sqlite3_finalize(stmt);
+                }
+                
+                sqlite3_close(main_db);
+            }
+        }
+        else if (strcmp(query_requested, "View_all_users") == 0) {
+            sqlite3 *main_db;
+            sqlite3_stmt *stmt;
+            int dbResult;
+            
+            dbResult = sqlite3_open(DATABASE_NAME, &main_db);
+            if (dbResult != SQLITE_OK) {
+                strcpy(response, "Failed to open database");
+            } else {
+                const char *view_all_users_sql = "SELECT Username, Role FROM Users;";
+                dbResult = sqlite3_prepare_v2(main_db, view_all_users_sql, -1, &stmt, 0);
+                
+                if (dbResult != SQLITE_OK) {
+                    strcpy(response, "Failed to prepare statement");
+                } else {
+                    char temp_response[BUFFER_SIZE] = "";
+                    while ((dbResult = sqlite3_step(stmt)) == SQLITE_ROW) {
+                        const char *user = (const char *)sqlite3_column_text(stmt, 0);
+                        const char *role = (const char *)sqlite3_column_text(stmt, 1);
+                        char user_info[STRING_SIZE];
+                        snprintf(user_info, STRING_SIZE, "Username: %s, Role: %s\n", user, role);
+                        strcat(temp_response, user_info);
+                    }
+                    
+                    if (strlen(temp_response) > 0) {
+                        strncpy(response, temp_response, BUFFER_SIZE - 1);
+                        response[BUFFER_SIZE - 1] = '\0';
+                    } else {
+                        strcpy(response, "No users found");
+                    }
+                    
+                    sqlite3_finalize(stmt);
+                }
+                
+                sqlite3_close(main_db);
+            }
+        }
+        else if (strcmp(query_requested, "Update_product") == 0) {
+            char product_name[STRING_SIZE];
+            char product_category[STRING_SIZE];
+            int product_quantity;
+            double product_price;
+            
+            sscanf(buffer, "%s %s %s %d %le", query_requested, product_name, product_category, &product_quantity, &product_price);
+            
+            sqlite3 *main_db;
+            sqlite3_stmt *stmt;
+            int dbResult;
+            
+            dbResult = sqlite3_open(DATABASE_NAME, &main_db);
+            if (dbResult != SQLITE_OK) {
+                strcpy(response, "Failed to open database");
+            } else {
+                const char *update_product_sql = "UPDATE Products SET Category = ?, Quantity = ?, Price = ? WHERE ProductName = ?;";
+                dbResult = sqlite3_prepare_v2(main_db, update_product_sql, -1, &stmt, 0);
+                
+                if (dbResult != SQLITE_OK) {
+                    strcpy(response, "Failed to prepare statement");
+                } else {
+                    sqlite3_bind_text(stmt, 1, product_category, -1, SQLITE_STATIC);
+                    sqlite3_bind_int(stmt, 2, product_quantity);
+                    sqlite3_bind_double(stmt, 3, product_price);
+                    sqlite3_bind_text(stmt, 4, product_name, -1, SQLITE_STATIC);
+                    
+                    dbResult = sqlite3_step(stmt);
+                    
+                    if (dbResult == SQLITE_DONE) {
+                        if (sqlite3_changes(main_db) > 0) {
+                            strcpy(response, "Product updated successfully");
+                        } else {
+                            strcpy(response, "Product not found");
+                        }
+                    } else {
+                        strcpy(response, "Failed to update product");
+                    }
+                    
+                    sqlite3_finalize(stmt);
+                }
+                
+                sqlite3_close(main_db);
+            }
+        }
+        else if (strcmp(query_requested, "Add_product") == 0) {
+            char product_name[STRING_SIZE];
+            char product_category[STRING_SIZE];
+            int product_quantity;
+            double product_price;
+
+            sscanf(buffer, "%s %s %s %d %le", query_requested, product_name, product_category, &product_quantity, &product_price);
+            bool added_new_product = add_product_query(product_name, product_category, product_quantity, product_price);
+
+            if (added_new_product) {
+                strcpy(response, "Added the new product successfully\n");
+            }
+            else {
+                strcpy(response, "Failed to add the new product\n");
+            }
+        }
+        else if (strcmp(query_requested, "Delete_product") == 0) {
+            char product_name[STRING_SIZE];
+            sscanf(buffer, "%s %s", query_requested, product_name);
+            
+            sqlite3 *main_db;
+            sqlite3_stmt *stmt;
+            int dbResult;
+            
+            dbResult = sqlite3_open(DATABASE_NAME, &main_db);
+            if (dbResult != SQLITE_OK) {
+                strcpy(response, "Failed to open database");
+            } else {
+                const char *delete_product_sql = "DELETE FROM Products WHERE ProductName = ?;";
+                dbResult = sqlite3_prepare_v2(main_db, delete_product_sql, -1, &stmt, 0);
+                
+                if (dbResult != SQLITE_OK) {
+                    strcpy(response, "Failed to prepare statement");
+                } else {
+                    sqlite3_bind_text(stmt, 1, product_name, -1, SQLITE_STATIC);
+                    dbResult = sqlite3_step(stmt);
+                    
+                    if (dbResult == SQLITE_DONE) {
+                        if (sqlite3_changes(main_db) > 0) {
+                            strcpy(response, "Product deleted successfully");
+                        } else {
+                            strcpy(response, "Product not found");
+                        }
+                    } else {
+                        strcpy(response, "Failed to delete product");
+                    }
+                    
+                    sqlite3_finalize(stmt);
+                }
+                
+                sqlite3_close(main_db);
+            }
+        }
+        else if (strcmp(query_requested, "View_product") == 0) {
+            char product_name[STRING_SIZE];
+            sscanf(buffer, "%s %s", query_requested, product_name);
+            
+            sqlite3 *main_db;
+            sqlite3_stmt *stmt;
+            int dbResult;
+            
+            dbResult = sqlite3_open(DATABASE_NAME, &main_db);
+            if (dbResult != SQLITE_OK) {
+                strcpy(response, "Failed to open database");
+            } else {
+                const char *view_product_sql = "SELECT ProductName, Category, Quantity, Price FROM Products WHERE ProductName = ?;";
+                dbResult = sqlite3_prepare_v2(main_db, view_product_sql, -1, &stmt, 0);
+                
+                if (dbResult != SQLITE_OK) {
+                    strcpy(response, "Failed to prepare statement");
+} else {
+                    sqlite3_bind_text(stmt, 1, product_name, -1, SQLITE_STATIC);
+                    dbResult = sqlite3_step(stmt);
+                    
+                    if (dbResult == SQLITE_ROW) {
+                        const char *name = (const char *)sqlite3_column_text(stmt, 0);
+                        const char *category = (const char *)sqlite3_column_text(stmt, 1);
+                        int quantity = sqlite3_column_int(stmt, 2);
+                        double price = sqlite3_column_double(stmt, 3);
+                        snprintf(response, BUFFER_SIZE, "Name: %s, Category: %s, Quantity: %d, Price: %.2f", name, category, quantity, price);
+                    } else {
+                        strcpy(response, "Product not found");
+                    }
+                    
+                    sqlite3_finalize(stmt);
+                }
+                
+                sqlite3_close(main_db);
+            }
+        }
+        else if (strcmp(query_requested, "View_all_products") == 0) {
+            sqlite3 *main_db;
+            sqlite3_stmt *stmt;
+            int dbResult;
+            
+            dbResult = sqlite3_open(DATABASE_NAME, &main_db);
+            if (dbResult != SQLITE_OK) {
+                strcpy(response, "Failed to open database");
+            } else {
+                const char *view_all_products_sql = "SELECT ProductName, Category, Quantity, Price FROM Products;";
+                dbResult = sqlite3_prepare_v2(main_db, view_all_products_sql, -1, &stmt, 0);
+                
+                if (dbResult != SQLITE_OK) {
+                    strcpy(response, "Failed to prepare statement");
+                } else {
+                    char temp_response[BUFFER_SIZE] = "";
+                    while ((dbResult = sqlite3_step(stmt)) == SQLITE_ROW) {
+                        const char *name = (const char *)sqlite3_column_text(stmt, 0);
+                        const char *category = (const char *)sqlite3_column_text(stmt, 1);
+                        int quantity = sqlite3_column_int(stmt, 2);
+                        double price = sqlite3_column_double(stmt, 3);
+                        char product_info[STRING_SIZE];
+                        snprintf(product_info, STRING_SIZE, "Name: %s, Category: %s, Quantity: %d, Price: %.2f\n", name, category, quantity, price);
+                        strcat(temp_response, product_info);
+                    }
+                    
+                    if (strlen(temp_response) > 0) {
+                        strncpy(response, temp_response, BUFFER_SIZE - 1);
+                        response[BUFFER_SIZE - 1] = '\0';
+                    } else {
+                        strcpy(response, "No products found");
+                    }
+                    
+                    sqlite3_finalize(stmt);
+                }
+                
+                sqlite3_close(main_db);
+            }
+        }
+        else {
+            strcpy(response, "Server: Invalid Query, please try again");
+        }
+
         SSL_write(ssl, response, strlen(response));
     }
+
+    free(user_role);
 }
 
 int main(int argc, char **argv) {
@@ -251,6 +845,11 @@ int main(int argc, char **argv) {
     // Parse command line arguments for port
     if (argc == 2) {
         port = atoi(argv[1]);
+    }
+
+    if (!create_database()) {
+        printf("Server: Failed to initially set up the main db and/or tables.\n");
+        return EXIT_FAILURE;
     }
 
     // Create socket and start listening
