@@ -2,8 +2,12 @@
 * @file enc-server.c
 * @author ** Alexander E Barthlett, Richard Disimoni **
 * @date  ** Due: October 20, 2024 **
-* @brief  fill in here
+* @brief  This program implements a multi-threaded SSL server with database user authentication and product management.
+          The server handles client requests over a secure connection, including adding, updating, deleting, and viewing users and products.
+          It uses OpenSSL for secure communication, SQLite3 for the databe and POSIX threads for concurrent client handling.
+          SQLite3 mutex locks are also in use for read/write operations.
 */
+
 #include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
@@ -15,432 +19,1041 @@
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <signal.h>
+#include <pthread.h>
+#include <time.h>
 
 #include <sqlite3.h>
 
-#define BUFFER_SIZE       256
+// Constants for server configuration
+#define BUFFER_SIZE       1024
 #define STRING_SIZE       50
 #define DEFAULT_PORT      4433
 #define CERTIFICATE_FILE  "cert.pem"
 #define KEY_FILE          "key.pem"
-#define DATABASE_NAME     "test_database.db"
+#define DATABASE_NAME     "main_database.db"
+#define REPLICA_DB_NAME   "replica_database.db"
+#define REPLICA_SERVER    "localhost"
+#define REPLICA_PORT      5433
+#define ADMIN_USERNAME    "test@regis.edu"
+#define ADMIN_PASSWORD    "TestP@ss"
+
+pthread_rwlock_t rwlock = PTHREAD_RWLOCK_INITIALIZER; // Global mutex lock for threads to use.
+
+// Configuration structure for server settings
+typedef struct {
+    int replication_interval;  // in seconds
+} ServerConfig;
+
+// Global configuration object with default values
+ServerConfig config = {60};  // Default replication interval: 60 seconds
+
+// Function prototypes
+int create_socket(unsigned int port);
+void init_openssl();
+void cleanup_openssl();
+SSL_CTX* create_new_context();
+void configure_context(SSL_CTX* ssl_ctx);
+void* replication_thread(void* arg);
+bool authenticate_client(SSL* ssl, char** user_role);
+void handle_client(SSL* ssl, int client, char* client_addr);
+bool create_database();
+bool add_user_query(char* username, char* password, char* new_role);
+bool add_product_query(char* product_name, char* product_category, int product_quantity, double product_price);
+bool login_query(char* username, char* password, char** user_role);
 
 /**
-* @brief This function does the basic necessary housekeeping to establish TCP connections
-* to the server.  It first creates a new socket, binds the network interface of
-* the machine to that socket, then listens on the socket for incoming TCP
-* connections.
-*/
-int create_socket(unsigned int port) {
-  int    s;
-  struct sockaddr_in addr;
-
-  // First we set up a network socket. An IP socket address is a combination
-  // of an IP interface address plus a 16-bit port number. The struct field
-  // sin_family is *always* set to AF_INET. Anything else returns an error.
-  // The TCP port is stored in sin_port, but needs to be converted to the
-  // format on the host machine to network byte order, which is why htons()
-  // is called. Setting s_addr to INADDR_ANY binds the socket and listen on
-  // any available network interface on the machine, so clients can connect
-  // through any, e.g., external network interface, localhost, etc.
-
-  addr.sin_family = AF_INET;
-  addr.sin_port = htons(port);
-  addr.sin_addr.s_addr = htonl(INADDR_ANY);
-
-  // Create a socket (endpoint) for network communication.  The socket()
-  // call returns a socket descriptor, which works exactly like a file
-  // descriptor for file system operations we worked with in CS431
-  //
-  // Sockets are by default blocking, so the server will block while reading
-  // from or writing to a socket. For most applications this is acceptable.
-  s = socket(AF_INET, SOCK_STREAM, 0);
-  if (s < 0) {
-    fprintf(stderr, "Server: Unable to create socket: %s", strerror(errno));
-    exit(EXIT_FAILURE);
-  }
-
-  // When you create a socket, it exists within a namespace, but does not have
-  // a network address associated with it.  The bind system call creates the
-  // association between the socket and the network interface.
-  //
-  // An error could result from an invalid socket descriptor, an address already
-  // in use, or an invalid network address
-  if (bind(s, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-    fprintf(stderr, "Server: Unable to bind to socket: %s", strerror(errno));
-    exit(EXIT_FAILURE);
-  }
-
-  // Listen for incoming TCP connections using the newly created and configured
-  // socket. The second argument (1) indicates the number of pending connections
-  // allowed, which in this case is one.  That means if the server is connected
-  // to one client, a second client attempting to connect may receive an error,
-  // e.g., connection refused.
-  //
-  // Failure could result from an invalid socket descriptor or from using a
-  // socket descriptor that is already in use.
-  if (listen(s, 1) < 0) {
-    fprintf(stderr, "Server: Unable to listen: %s", strerror(errno));
-    exit(EXIT_FAILURE);
-  }
-
-  printf("Server: Listening on TCP port %u\n", port);
-
-  return s;
+ * This method converts a SHA256 binary hash into a hexidecimal string for readability.
+ */
+void sha256_hash_string(unsigned char hash[SHA256_DIGEST_LENGTH], char outputBuffer[65]) {
+    int i;
+    for (i = 0; i < SHA256_DIGEST_LENGTH; i++) {
+        sprintf(outputBuffer + (i * 2), "%02x", hash[i]);
+    }
+    outputBuffer[64] = 0;
 }
 
 /**
-* @brief This function does some initialization of the OpenSSL library functions used in
-*        this program.  The function SSL_load_error_strings registers the error strings
-*        for all of the libssl and libcrypto functions so that appropriate textual error
-*        messages are displayed when error conditions arise. OpenSSL_add_ssl_algorithms
-*        registers the available SSL/TLS ciphers and digests used for encryption.
-*/
-void init_openssl() {
-  SSL_load_error_strings();
-  OpenSSL_add_ssl_algorithms();
+ * Converts a string representing a password, into a SHA256 binary string for encryption.
+ */
+void hash_password(const char *password, unsigned char *hash_output) {
+    EVP_MD_CTX *mdctx;
+    const EVP_MD *md;
+    unsigned int hash_length;
+
+    mdctx = EVP_MD_CTX_new();
+    md = EVP_sha256();
+
+    EVP_DigestInit_ex(mdctx, md, NULL);
+    EVP_DigestUpdate(mdctx, password, strlen(password));
+    EVP_DigestFinal_ex(mdctx, hash_output, &hash_length);
+
+    EVP_MD_CTX_free(mdctx);
 }
 
 /**
-* @brief EVP_cleanup removes all of the SSL/TLS ciphers and digests registered earlier.
-*/
-void cleanup_openssl() {
-  EVP_cleanup();
-}
+ * Creates the main database, creates a user table if it doesnt exist, and creates a product table if it doesnt exist.  
+ * Also adds the initial admin user to the user table if it doesnt exist.
+ */
+bool create_database() {
+    const char *create_table_sql = "CREATE TABLE IF NOT EXISTS Users(Username TEXT NOT NULL UNIQUE PRIMARY KEY, Password TEXT NOT NULL, Role Text NOT NULL);";
+    const char *create_product_table_sql = "CREATE TABLE IF NOT EXISTS Products(ProductID INTEGER PRIMARY KEY AUTOINCREMENT, ProductName TEXT NOT NULL, Category TEXT NOT NULL, Quantity INTEGER NOT NULL, Price REAL NOT NULL);";
+    const char *check_admin_sql = "SELECT COUNT(*) FROM Users WHERE Username=?;";
 
-/**
-* @brief An SSL_CTX object is an instance of a factory design pattern that produces SSL
-*        connection objects, each called a context. A context is used to set parameters
-*        for the connection, and in this program, each context is configured using the
-*        configure_context() function below. Each context object is created using the
-*        function SSL_CTX_new(), and the result of that call is what is returned by this
-*        function and subsequently configured with connection information.
-*
-*        One other thing to point out is when creating a context, the SSL protocol must
-*        be specified ahead of time using an instance of an SSL_method object.  In this
-*        case, we are creating an instance of an SSLv23_server_method, which is an
-*        SSL_METHOD object for an SSL/TLS server. Of the available types in the OpenSSL
-*        library, this provides the most functionality.
-*/
-SSL_CTX* create_new_context() {
-  const SSL_METHOD* ssl_method; // This should be declared 'const' to avoid
-                                // getting a compiler warning about the call to
-                                // SSLv23_server_method()
-  SSL_CTX*          ssl_ctx;
+    sqlite3 *main_db;
+    sqlite3_stmt *stmt;
+    char *err_msg = 0;
+    int dbResult;
 
-  // Use SSL/TLS method for server
-  ssl_method = SSLv23_server_method();
+    dbResult = sqlite3_open(DATABASE_NAME, &main_db);
 
-  // Create new context instance
-  ssl_ctx = SSL_CTX_new(ssl_method);
-  if (ssl_ctx == NULL) {
-    fprintf(stderr, "Server: cannot create SSL context:\n");
-    ERR_print_errors_fp(stderr);
-    exit(EXIT_FAILURE);
-  }
+    if (dbResult != SQLITE_OK) {
+        fprintf(stderr, "Failed to open main database: %s\n", sqlite3_errmsg(main_db));
+        sqlite3_close(main_db);
+        return false;
+    }
+    
+    dbResult = sqlite3_exec(main_db, create_table_sql, 0, 0, &err_msg);
 
-  return ssl_ctx;
-}
-
-/**
-* @brief We will use Elliptic Curve Diffie Hellman anonymous key agreement protocol for
-*        the session key shared between client and server.  We first configure the SSL
-*        context to use that protocol by calling the function SSL_CTX_set_ecdh_auto().
-*        The second argument (onoff) tells the function to automatically use the highest
-*        preference curve (supported by both client and server) for the key agreement.
-*
-*        Note that for error conditions specific to SSL/TLS, the OpenSSL library does
-*        not set the variable errno, so we must use the built-in error printing routines.
-*/
-void configure_context(SSL_CTX* ssl_ctx) {
-  SSL_CTX_set_ecdh_auto(ssl_ctx, 1);
-
-  // Set the certificate to use, i.e., 'cert.pem'
-  if (SSL_CTX_use_certificate_file(ssl_ctx, CERTIFICATE_FILE, SSL_FILETYPE_PEM)
-      <= 0) {
-    fprintf(stderr, "Server: cannot set certificate:\n");
-    ERR_print_errors_fp(stderr);
-    exit(EXIT_FAILURE);
-  }
-
-  // Set the private key contained in the key file, i.e., 'key.pem'
-  if (SSL_CTX_use_PrivateKey_file(ssl_ctx, KEY_FILE, SSL_FILETYPE_PEM) <= 0 ) {
-    fprintf(stderr, "Server: cannot set certificate:\n");
-    ERR_print_errors_fp(stderr);
-    exit(EXIT_FAILURE);
-  }
-}
-
-void exitClientCall(SSL* ssl, int* client, char* client_addr) {
-    printf("Server: Terminating SSL session and TCP connection with client (%s)\n",
-	    client_addr);
-
-    SSL_shutdown(ssl);
-    SSL_free(ssl);
-    close(*client);
-}
-
-bool createDatabaseAndUserTable(sqlite3** db, char* sql, char* err_msg, int* rc) {
-    sql = "CREATE TABLE IF NOT EXISTS Users(Email TEXT, Password TEXT);";
-
-    *rc = sqlite3_open(DATABASE_NAME, db); // Opens and/or creates a database.
-
-    if (*rc) { // Error checking
-        fprintf(stderr, "Failed to open the database: %s\n", sqlite3_errmsg(*db));
+    if (dbResult != SQLITE_OK) {
+        fprintf(stderr,"SQL error: %s\n", err_msg);
+        sqlite3_free(err_msg);
+        sqlite3_close(main_db);
         return false;
     }
 
-    else {
-        fprintf(stdout, "Opened/created the database successfully\n");
+    dbResult = sqlite3_exec(main_db, create_product_table_sql, 0, 0, &err_msg);
 
-        *rc = sqlite3_exec(*db, sql, 0, 0, &err_msg); // execute the sql statement creating the user table if doesnt exist
+    if (dbResult != SQLITE_OK) {
+        fprintf(stderr,"SQL error: %s\n", err_msg);
+        sqlite3_free(err_msg);
+        sqlite3_close(main_db);
+        return false;
+    }
+    
+    printf("Users table checked/created successfully.\n");
+    printf("Products table checked/created successfully.\n");
 
-        if (*rc != SQLITE_OK) { // Failed executing the statement
-          fprintf(stderr, "SQL error: %s\n", err_msg);
-          sqlite3_free(err_msg);
-          return false;
-        }
+    dbResult = sqlite3_prepare_v2(main_db, check_admin_sql, -1, &stmt, 0);
 
-        else { // Success executing the sql statement.
-            fprintf(stdout, "User Table created successfully or already exists\n");
-        }
+    if (dbResult != SQLITE_OK) {
+        fprintf(stderr, "Failed to prepare statement: %s\n", sqlite3_errmsg(main_db));
+        sqlite3_close(main_db);
+        return false;
     }
 
+    sqlite3_bind_text(stmt, 1, ADMIN_USERNAME, -1, SQLITE_STATIC);
+
+    dbResult = sqlite3_step(stmt);
+    int admin_exists = sqlite3_column_int(stmt, 0);
+    sqlite3_finalize(stmt);
+
+    if (admin_exists == 0) {
+        unsigned char hash[SHA256_DIGEST_LENGTH];
+        char hash_string[SHA256_DIGEST_LENGTH * 2 + 1];
+
+        hash_password(ADMIN_PASSWORD, hash);
+        sha256_hash_string(hash, hash_string);
+
+        const char *insert_admin_sql = "INSERT INTO Users (Username, Password, Role) VALUES (?, ?, 'admin');";
+
+        dbResult = sqlite3_prepare_v2(main_db, insert_admin_sql, -1, &stmt, 0);
+
+        if (dbResult != SQLITE_OK) {
+            fprintf(stderr, "Failed to prepare insert statement: %s\n", sqlite3_errmsg(main_db));
+            sqlite3_close(main_db);
+            return false;
+        }
+
+        sqlite3_bind_text(stmt, 1, ADMIN_USERNAME, -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt, 2, hash_string, -1, SQLITE_STATIC);
+        dbResult = sqlite3_step(stmt);
+
+        if (dbResult != SQLITE_DONE) {
+            fprintf(stderr, "Failed to insert admin user: %s\n", sqlite3_errmsg(main_db));
+        }
+        else {
+            printf("Admin user created successfully with hashed password.\n");
+        }
+
+        sqlite3_finalize(stmt);
+    }
+    else {
+        printf("Admin user already exists.\n");
+    }
+
+    sqlite3_close(main_db);
     return true;
 }
 
-void addUserToDatabase(sqlite3* db, char* sql, char* err_msg, int* rc) {
-    const char *email_to_check = "test@regis.edu";
-    sqlite3_stmt *res; // first statement to use to check if a user is in the users table.
+/**
+ * Creates a socket and binds it to the specified port.
+ */
+int create_socket(unsigned int port) {
+    int s;
+    struct sockaddr_in addr;
 
-    sql = "SELECT Email FROM Users WHERE Email = ?;";
-
-    *rc = sqlite3_prepare_v2(db, sql, -1, &res, 0);
-
-    if (*rc == SQLITE_OK) { // statement prepared okay, bind the test email to the '?' in the sql statement.
-        sqlite3_bind_text(res, 1, email_to_check, -1, SQLITE_STATIC);
+    s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s < 0) {
+        fprintf(stderr, "Server: Unable to create socket: %s", strerror(errno));
+        exit(EXIT_FAILURE);
     }
 
-    else { // Failed to prepare statement
-        fprintf(stderr, "Failed to prepare statement: %s\n", sqlite3_errmsg(db));
-        
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+
+    if (bind(s, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        fprintf(stderr, "Server: Unable to bind to socket: %s", strerror(errno));
+        exit(EXIT_FAILURE);
     }
 
-    *rc = sqlite3_step(res); // execute the prepared statement
-
-    if (*rc == SQLITE_ROW) { // User with that email exists
-      fprintf(stdout, "User already exists with email: %s\n", email_to_check);
+    if (listen(s, 1) < 0) {
+        fprintf(stderr, "Server: Unable to listen: %s", strerror(errno));
+        exit(EXIT_FAILURE);
     }
 
-    else if (*rc == SQLITE_DONE) { // User doesnt exist, lets add the new user.
-        sql = "INSERT INTO Users (Email, Password) VALUES (?, ?);";
+    printf("Server: Listening on TCP port %u\n", port);
 
-        sqlite3_stmt *insert_stmt; // next statement to use, insert statement.
-
-        *rc = sqlite3_prepare_v2(db, sql, -1, &insert_stmt, 0); // prepare the insert statement
-
-        if (*rc == SQLITE_OK) { // prepared successfully, bind the email and password to the '?' in the insert statement
-          sqlite3_bind_text(insert_stmt, 1, "test@regis.edu", -1, SQLITE_STATIC);
-          sqlite3_bind_text(insert_stmt, 2, "TestP@ss", -1, SQLITE_STATIC);
-        
-          *rc = sqlite3_step(insert_stmt); // execute the insert statement.
-
-          if (*rc == SQLITE_DONE) { // execute statement success.
-            fprintf(stdout, "Test user entered into table successfully\n");
-          }
-
-          else { // execute statement failure
-            fprintf(stderr, "Failed to insert user: %s\n", sqlite3_errmsg(db));
-          }
-        }
-
-        else { // Failed to prepare the statement
-          fprintf(stderr, "Failed to prepare INSERT statement: %s\n", sqlite3_errmsg(db));
-        }
-
-        sqlite3_finalize(insert_stmt); // deallocate resources
-    }
-
-    else { // Failed to execute statement to find user
-        fprintf(stderr, "Error while checking for user: %s\n", sqlite3_errmsg(db));
-    }
-
-    sqlite3_finalize(res); // deallocate resources
+    return s;
 }
 
-bool logInCall() {
-    // Handle the log in loop here, request that the client log in, check their input to the db, and continue until logged in or receive a exit code from client (maybe CLIENT_EXIT)
+/**
+ * Initializes OpenSSL library.
+ */
+void init_openssl() {
+    SSL_load_error_strings();
+    OpenSSL_add_ssl_algorithms();
+}
+
+/**
+ * Cleans up OpenSSL library.
+ */
+void cleanup_openssl() {
+    EVP_cleanup();
+}
+
+/**
+ * Creates a new SSL context.
+ */
+SSL_CTX* create_new_context() {
+    const SSL_METHOD* ssl_method;
+    SSL_CTX* ssl_ctx;
+
+    ssl_method = SSLv23_server_method();
+    ssl_ctx = SSL_CTX_new(ssl_method);
+    if (ssl_ctx == NULL) {
+        fprintf(stderr, "Server: cannot create SSL context:\n");
+        ERR_print_errors_fp(stderr);
+        exit(EXIT_FAILURE);
+    }
+
+    return ssl_ctx;
+}
+
+/**
+ * Configures the SSL context with certificates and keys.
+ */
+void configure_context(SSL_CTX* ssl_ctx) {
+    SSL_CTX_set_ecdh_auto(ssl_ctx, 1);
+
+    if (SSL_CTX_use_certificate_file(ssl_ctx, CERTIFICATE_FILE, SSL_FILETYPE_PEM) <= 0) {
+        fprintf(stderr, "Server: cannot set certificate:\n");
+        ERR_print_errors_fp(stderr);
+        exit(EXIT_FAILURE);
+    }
+
+    if (SSL_CTX_use_PrivateKey_file(ssl_ctx, KEY_FILE, SSL_FILETYPE_PEM) <= 0 ) {
+        fprintf(stderr, "Server: cannot set private key:\n");
+        ERR_print_errors_fp(stderr);
+        exit(EXIT_FAILURE);
+    }
+}
+
+/**
+ * Thread function for database replication.
+ */
+void* replication_thread(void* arg) {
+    while (1) {
+        sleep(config.replication_interval);
+        
+        pthread_rwlock_wrlock(&rwlock); // Write lock for replication
+        sqlite3 *main_db, *replica_db;
+        char *err_msg = 0;
+        
+        if (sqlite3_open(DATABASE_NAME, &main_db) != SQLITE_OK) {
+            fprintf(stderr, "Failed to open main database: %s\n", sqlite3_errmsg(main_db));
+            continue;
+        }
+        
+        if (sqlite3_open(REPLICA_DB_NAME, &replica_db) != SQLITE_OK) {
+            fprintf(stderr, "Failed to open replica database: %s\n", sqlite3_errmsg(replica_db));
+            sqlite3_close(main_db);
+            continue;
+        }
+        
+        sqlite3_backup *backup = sqlite3_backup_init(replica_db, "main", main_db, "main");
+        if (backup) {
+            sqlite3_backup_step(backup, -1);
+            sqlite3_backup_finish(backup);
+        }
+        
+        if (sqlite3_errcode(replica_db) != SQLITE_OK) {
+            fprintf(stderr, "Replication failed: %s\n", sqlite3_errmsg(replica_db));
+        } else {
+            printf("Database replicated successfully.\n");
+        }
+        
+        sqlite3_close(main_db);
+        sqlite3_close(replica_db);
+        pthread_rwlock_unlock(&rwlock); // unlock lock
+    }
+
+    return NULL;
+}
+
+/**
+ * Function to add a new user to the SQLite database.
+ */
+bool add_user_query(char* username, char* password, char* new_role) {
+
+    pthread_rwlock_wrlock(&rwlock); // write lock
+    sqlite3 *main_db;
+    sqlite3_stmt *stmt;
+    int dbResult;
+
+    dbResult = sqlite3_open(DATABASE_NAME, &main_db);
+
+    if (dbResult != SQLITE_OK) {
+        fprintf(stderr, "Failed to open database: %s\n", sqlite3_errmsg(main_db));
+        pthread_rwlock_unlock(&rwlock); // unlock lock
+        return false;
+    }
+
+    const char *add_new_user_sql = "INSERT INTO Users (Username, Password, Role) VALUES (?, ?, ?);";
+
+    unsigned char hash[SHA256_DIGEST_LENGTH];
+    char hash_string[SHA256_DIGEST_LENGTH *2 +1];
+    hash_password(password, hash);
+    sha256_hash_string(hash, hash_string);
+
+    dbResult = sqlite3_prepare_v2(main_db, add_new_user_sql, -1, &stmt, 0);
+
+    if (dbResult != SQLITE_OK) {
+        fprintf(stderr, "Failed to prepare statement: %s\n", sqlite3_errmsg(main_db));
+        sqlite3_close(main_db);
+        pthread_rwlock_unlock(&rwlock); // unlock lock
+        return false;
+    }
+
+    sqlite3_bind_text(stmt, 1, username, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, hash_string, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 3, new_role, -1, SQLITE_STATIC);
+
+    dbResult = sqlite3_step(stmt);
+
+    if (dbResult != SQLITE_DONE) {
+        fprintf(stderr, "Failed to add new user: %s\n", sqlite3_errmsg(main_db));
+        sqlite3_finalize(stmt);
+        sqlite3_close(main_db);
+        pthread_rwlock_unlock(&rwlock); // unlock lock
+        return false;
+    }
+
+    sqlite3_finalize(stmt);
+    sqlite3_close(main_db);
+
+    pthread_rwlock_unlock(&rwlock); // unlock lock
+
+    printf("User added successfully.\n");
+    return true;
+}
+
+/**
+ * This function adds a new product to the product table in the SQLite database.
+ */
+bool add_product_query(char* product_name, char* product_category, int product_quantity, double product_price) {
+
+    pthread_rwlock_wrlock(&rwlock); // write lock
+
+    sqlite3 *main_db;
+    sqlite3_stmt *stmt;
+    int dbResult;
+
+    dbResult = sqlite3_open(DATABASE_NAME, &main_db);
+
+    if (dbResult != SQLITE_OK) {
+        fprintf(stderr, "Failed to open database: %s\n", sqlite3_errmsg(main_db));
+        pthread_rwlock_unlock(&rwlock); // unlock lock
+        return false;
+    }
+
+    const char *add_new_product_sql = "INSERT INTO Products (ProductName, Category, Quantity, Price) VALUES (?, ?, ?, ?);";
+
+    dbResult = sqlite3_prepare_v2(main_db, add_new_product_sql, -1, &stmt, 0);
+
+    if (dbResult != SQLITE_OK) {
+        fprintf(stderr, "Failed to prepare statement: %s\n", sqlite3_errmsg(main_db));
+        sqlite3_close(main_db);
+        pthread_rwlock_unlock(&rwlock); // unlock lock
+        return false;
+    }
+
+    sqlite3_bind_text(stmt, 1, product_name, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, product_category, -1, SQLITE_STATIC);
+    sqlite3_bind_int(stmt, 3, product_quantity);
+    sqlite3_bind_double(stmt, 4, product_price);
+
+    dbResult = sqlite3_step(stmt);
+
+    if (dbResult != SQLITE_DONE) {
+        fprintf(stderr, "Failed to add new product: %s\n", sqlite3_errmsg(main_db));
+        sqlite3_finalize(stmt);
+        sqlite3_close(main_db);
+        pthread_rwlock_unlock(&rwlock); // unlock lock
+        return false;
+}
+
+    sqlite3_finalize(stmt);
+    sqlite3_close(main_db);
+
+    pthread_rwlock_unlock(&rwlock); // unlock lock
+
+    printf("Product added successfully.\n");
+    return true;
+}
+
+/**
+ * This function checks to see if a user exists with the correct password and if so, 
+ * changes a variable to represent the correct user role such as if they are a system admin, and return if logging in was successful.
+ */
+bool login_query(char* username, char* password, char** user_role) {
+
+    pthread_rwlock_rdlock(&rwlock); // read lock
+
+    sqlite3 *main_db;
+    sqlite3_stmt *stmt;
+    int dbResult;
+
+    dbResult = sqlite3_open(DATABASE_NAME, &main_db);
+
+    if (dbResult != SQLITE_OK) {
+        fprintf(stderr, "Failed to open database: %s\n", sqlite3_errmsg(main_db));
+        pthread_rwlock_unlock(&rwlock); // unlock lock
+        return false;
+    }
+
+    const char *get_user_sql = "SELECT Password, Role FROM Users WHERE Username = ?;";
+
+    dbResult = sqlite3_prepare_v2(main_db, get_user_sql, -1, &stmt, 0);
+
+    if (dbResult != SQLITE_OK) {
+        fprintf(stderr, "Failed to prepare statement: %s\n", sqlite3_errmsg(main_db));
+        sqlite3_close(main_db);
+        pthread_rwlock_unlock(&rwlock); // unlock lock
+        return false;
+    }
+
+    sqlite3_bind_text(stmt, 1, username, -1, SQLITE_STATIC);
+
+    dbResult = sqlite3_step(stmt);
+
+    if (dbResult == SQLITE_ROW) {
+        const char *stored_hash = (const char *)sqlite3_column_text(stmt, 0);
+        const char *role = (const char *)sqlite3_column_text(stmt, 1);
+
+        unsigned char hash[SHA256_DIGEST_LENGTH];
+        char hash_string[SHA256_DIGEST_LENGTH * 2 + 1];
+        hash_password(password, hash);
+        sha256_hash_string(hash, hash_string);
+
+        if (strcmp(stored_hash, hash_string) == 0) {
+            *user_role = strdup(role);
+            sqlite3_finalize(stmt);
+            sqlite3_close(main_db);
+            pthread_rwlock_unlock(&rwlock); // unlock lock
+            return true;
+        }
+        else {
+            printf("Authentication failed: Invalid password.\n");
+        }
+    }
+    else {
+        printf("Authentication failed: Username not found.\n");
+    }
+
+    sqlite3_finalize(stmt);
+    sqlite3_close(main_db);
+    pthread_rwlock_unlock(&rwlock); // unlock lock
     return false;
 }
 
 /**
-@brief The sequence of steps required to establish a secure SSL/TLS connection is:
-*
-*        1.  Initialize the SSL algorithms
-*        2.  Create and configure an SSL context object
-*        3.  Create a new network socket in the traditional way
-*        4.  Listen for incoming connections
-*        5.  Accept incoming connections as they arrive
-*        6.  Create a new SSL object for the newly arrived connection
-*        7.  Bind the SSL object to the network socket descriptor
-*
-*        Once these steps are completed successfully, use the functions SSL_read() and
-*        SSL_write() to read from/write to the socket, but using the SSL object rather
-*        then the socket descriptor.  Once the session is complete, free the memory
-*        allocated to the SSL object and close the socket descriptor.
-*/
-int main(int argc, char **argv) {
-  SSL_CTX*     ssl_ctx;
-  unsigned int sockfd;
-  unsigned int port;
-  char         buffer[BUFFER_SIZE];
-  int          rc;
-  char         *err_msg = 0;
-  char         *sql;
-  sqlite3      *db;
-  bool         dbAndUserTableCreated;
+ * Authenticates a client connection.
+ */
+bool authenticate_client(SSL* ssl, char** user_role) {
+    char buffer[BUFFER_SIZE];
+    int bytes;
+    
+    const char* auth_request = "Please provide your username and password.";
 
-  if (dbAndUserTableCreated = createDatabaseAndUserTable(&db, sql, err_msg, &rc)) { // Creates/opens database and creates user table if it doesnt exist in the db.
-
-    addUserToDatabase(db, sql, err_msg, &rc); // Adds a user to the db if they arent in it already.
-  }
-
-  else {
-    fprintf(stdout, "Server: Failed to create database or user table, exiting now\n");
-
-    return EXIT_FAILURE;
-  }
-
-  signal(SIGPIPE, SIG_IGN);
-
-  // Initialize and create SSL data structures and algorithms
-  init_openssl();
-  ssl_ctx = create_new_context();
-  configure_context(ssl_ctx);
-
-  // Port can be specified on the command line. If it's not, use default port
-  switch(argc) {
-  case 1:
-    port = DEFAULT_PORT;
-    break;
-  case 2:
-    port = atoi(argv[1]);
-    break;
-  default:
-    fprintf(stderr, "Usage: ssl-server <port> (optional)\n");
-    exit(EXIT_FAILURE);
-  }
-
-  // This will create a network socket and return a socket descriptor, which is
-  // and works just like a file descriptor, but for network communcations. Note
-  // we have to specify which TCP/UDP port on which we are communicating as an
-  // argument to our user-defined create_socket() function.
-  sockfd = create_socket(port);
-
-  // Wait for incoming connections and handle them as the arrive
-  while(true) {
-    SSL*               ssl;
-    int                client;
-    const  char        reply[] = "Hello World!";
-    struct sockaddr_in addr;
-    unsigned int       len = sizeof(addr);
-    char               client_addr[INET_ADDRSTRLEN];
-    char               initialMessage[] = "You have connect to the server, welcome!";
-    char               logInMessage[] = "LOG_IN";
-    int                initialMessageSent;
-    int                logInMessageSent;
-    int                messageRead;
-    char               userName[STRING_SIZE];
-    char               userPassword[STRING_SIZE];
-
-    // Once an incoming connection arrives, accept it.  If this is successful,
-    // we now have a connection between client and server and can communicate
-    // using the socket descriptor
-    client = accept(sockfd, (struct sockaddr*)&addr, &len);
-    if (client < 0) {
-      fprintf(stderr, "Server: Unable to accept connection: %s\n",
-	      strerror(errno));
-      exit(EXIT_FAILURE);
+    if ((bytes = SSL_write(ssl, auth_request, strlen(auth_request))) < 0) {
+        fprintf(stderr, "Failed to write, Error: %s\n", strerror(errno));
+        return EXIT_FAILURE;
+    }
+    
+    if ((bytes = SSL_read(ssl, buffer, sizeof(buffer))) < 0) {
+        fprintf(stderr, "Failed to read, Error: %s\n", strerror(errno));
+        return EXIT_FAILURE;
     }
 
-    // Display the IPv4 network address of the connected client
-    inet_ntop(AF_INET, (struct in_addr*)&addr.sin_addr, client_addr,
-	      INET_ADDRSTRLEN);
-    printf("Server: Established TCP connection with client (%s) on port %u\n",
-	   client_addr, port);
-
-   // Here we are creating a new SSL object to bind to the socket descriptor
-    ssl = SSL_new(ssl_ctx);
-
-    // Bind the SSL object to the network socket descriptor. The socket
-    // descriptor will be used by OpenSSL to communicate with a client. This
-    // function should only be called once the TCP connection is established.
+    buffer[bytes] = 0;
     
-    SSL_set_fd(ssl, client);
+    char username[STRING_SIZE], password[STRING_SIZE];
+    sscanf(buffer, "%s %s", username, password);
 
-    // The last step in establishing a secure connection is calling SSL_accept(),
-    // which executes the SSL/TLS handshake.  Because network sockets are
-    // blocking by default, this function will block as well until the handshake
-    // is complete.
-    if (SSL_accept(ssl) <= 0) {
-      fprintf(stderr, "Server: Could not establish secure connection:\n");
-      ERR_print_errors_fp(stderr);
-    } else {
-      printf("Server: Established SSL/TLS connection with client (%s)\n",
-	     client_addr);
+    return login_query(username, password, user_role);
+}
 
-      // ***********************************************************************
-      // YOUR CODE HERE
-      //
-      // You will need to use the SSL_read and SSL_write functions, which work
-      // in the same manner as traditional read and write system calls, but use
-      // the SSL socket descriptor 'ssl' declared above instead of a file
-      // descriptor.
-      // ***********************************************************************
+/**
+ * Handles communication with an authenticated client.
+ */
+void handle_client(SSL* ssl, int client, char* client_addr) {
+    char buffer[BUFFER_SIZE];
+    int bytes;
+    char* user_role = NULL; // admin or other
+    
+    if (!authenticate_client(ssl, &user_role)) {
+        const char* auth_failed = "Authentication failed. Closing connection.";
 
-        bzero(buffer, BUFFER_SIZE);
-
-        if ((initialMessageSent = SSL_write(ssl, initialMessage, strlen(initialMessage))) < 0) {
-            fprintf(stderr, "Server: Failed to send the initial message to the client, Error: %s\n", strerror(errno));
-
-            exitClientCall(ssl, &client, client_addr);
+        if ((bytes = SSL_write(ssl, auth_failed, strlen(auth_failed))) < 0) {
+            fprintf(stderr, "Failed to write, Error: %s\n", strerror(errno));
+            exit(EXIT_FAILURE);
         }
 
-        else {
-            fprintf(stdout, "Server: Sent message successfully, message: %s\n", initialMessage);
+        return;
+    }
+    
+    char* auth_success;
+    if (strcmp(user_role, "admin") == 0) { // is a admin
+        auth_success = "Authentication successful. You can now send queries.\n"
+                                    "1: Update_product\n"
+                                    "2: Add_product\n"
+                                    "3: Delete_product\n"
+                                    "4: View_product\n"
+                                    "5: View_all_products\n"
+                                    "6: Add_user\n"
+                                    "7: Delete_user\n"
+                                    "8: View_user\n"
+                                    "9: View_all_users\n";
+    }
+    else { // Not a admin
+        auth_success = "Authentication successful. You can now send queries.\n"
+                                    "1: Update_product\n"
+                                    "2: Add_product\n"
+                                    "3: Delete_product\n"
+                                    "4: View_product\n"
+                                    "5: View_all_products\n";                               
+    }
 
-            if ((logInMessageSent = SSL_write(ssl, logInMessage, strlen(logInMessage))) < 0) {
-                fprintf(stderr, "Server: Failed to send the log in message to the client, Error: %s\n", strerror(errno));
-                
-                exitClientCall(ssl, &client, client_addr);
+    fprintf(stdout, "User role is: %s\n", user_role); // For testing
+
+    if ((bytes = SSL_write(ssl, auth_success, strlen(auth_success))) < 0) {
+        fprintf(stderr, "Failed to write, Error: %s\n", strerror(errno));
+        exit(EXIT_FAILURE);
+    }
+    
+    while (1) {
+
+        if ((bytes = SSL_read(ssl, buffer, sizeof(buffer))) < 0) { // Read a query from the client
+            fprintf(stderr, "Failed to read, Error: %s\n", strerror(errno));
+            exit(EXIT_FAILURE);
+        }
+        
+        buffer[bytes] = 0;
+        char response[BUFFER_SIZE];
+
+        char query_requested[STRING_SIZE];
+
+        sscanf(buffer, "%s", query_requested);
+
+        if (strcmp(query_requested, "Add_user") == 0) {
+
+            if(strcmp(user_role, "admin") != 0) { // Must be a admin
+                strcpy(response, "You do not have the proper role to make this query\n");
             }
 
             else {
-                fprintf(stdout, "Server: Sent log in message successfully, message: %s\n", logInMessage);
-                bzero(buffer, BUFFER_SIZE);
-                if ((messageRead = SSL_read(ssl, buffer, BUFFER_SIZE)) < 0) {
-                    fprintf(stderr, "Server: Failed to send the log in message to the client, Error: %s\n", strerror(errno));
-                    
-                    exitClientCall(ssl, &client, client_addr);
-                }
+                char username[STRING_SIZE];
+                char password[STRING_SIZE];
+                char role[STRING_SIZE];
 
+                sscanf(buffer, "%s %s %s %s", query_requested, username, password, role);
+                bool added_new_user = add_user_query(username, password, role);
+
+                if (added_new_user) {
+                    strcpy(response, "Added the new user successfully\n");
+                }
                 else {
-                    sscanf(buffer, "%s %s", userName, userPassword);
-                    printf("Server: Message received, username received: %s, password received: %s\n", userName, userPassword);
+                    strcpy(response, "Failed to add the new user\n");
                 }
             }
         }
 
-        // Terminate the SSL session, close the TCP connection, and clean up
-        exitClientCall(ssl, &client, client_addr);
-    }
-  }
+        else if (strcmp(query_requested, "Delete_user") == 0) {
+            if(strcmp(user_role, "admin") != 0) { // Must be a admin
+                strcpy(response, "You do not have the proper role to make this query\n");
+            }
 
-    // Tear down and clean up server data structures before terminating
+            else {
+                char username[STRING_SIZE];
+                sscanf(buffer, "%s %s", query_requested, username);
+
+                pthread_rwlock_wrlock(&rwlock); // write lock
+            
+                sqlite3 *main_db;
+                sqlite3_stmt *stmt;
+                int dbResult;
+            
+                dbResult = sqlite3_open(DATABASE_NAME, &main_db);
+                if (dbResult != SQLITE_OK) {
+                    strcpy(response, "Failed to open database");
+                } else {
+                    const char *delete_user_sql = "DELETE FROM Users WHERE Username = ?;";
+                    dbResult = sqlite3_prepare_v2(main_db, delete_user_sql, -1, &stmt, 0);
+                
+                    if (dbResult != SQLITE_OK) {
+                        strcpy(response, "Failed to prepare statement");
+                    } else {
+                        sqlite3_bind_text(stmt, 1, username, -1, SQLITE_STATIC);
+                        dbResult = sqlite3_step(stmt);
+                    
+                        if (dbResult == SQLITE_DONE) {
+                            if (sqlite3_changes(main_db) > 0) {
+                                strcpy(response, "User deleted successfully");
+                            } else {
+                                strcpy(response, "User not found");
+                            }
+                        } else {
+                            strcpy(response, "Failed to delete user");
+                        }
+                    
+                        sqlite3_finalize(stmt);
+                    }
+                
+                    sqlite3_close(main_db);
+                }
+
+                pthread_rwlock_unlock(&rwlock); // unlock lock
+            }
+        }
+
+        else if (strcmp(query_requested, "View_user") == 0) {
+            if(strcmp(user_role, "admin") != 0) { // Must be a admin
+                strcpy(response, "You do not have the proper role to make this query\n");
+            }
+
+            else {
+                char username[STRING_SIZE];
+                sscanf(buffer, "%s %s", query_requested, username);
+
+                pthread_rwlock_rdlock(&rwlock); // read lock
+            
+                sqlite3 *main_db;
+                sqlite3_stmt *stmt;
+                int dbResult;
+            
+                dbResult = sqlite3_open(DATABASE_NAME, &main_db);
+                if (dbResult != SQLITE_OK) {
+                    strcpy(response, "Failed to open database");
+                } else {
+                    const char *view_user_sql = "SELECT Username, Role FROM Users WHERE Username = ?;";
+                    dbResult = sqlite3_prepare_v2(main_db, view_user_sql, -1, &stmt, 0);
+                
+                    if (dbResult != SQLITE_OK) {
+                        strcpy(response, "Failed to prepare statement");
+                    } else {
+                        sqlite3_bind_text(stmt, 1, username, -1, SQLITE_STATIC);
+                        dbResult = sqlite3_step(stmt);
+                    
+                        if (dbResult == SQLITE_ROW) {
+                            const char *user = (const char *)sqlite3_column_text(stmt, 0);
+                            const char *role = (const char *)sqlite3_column_text(stmt, 1);
+                            snprintf(response, BUFFER_SIZE, "Username: %s, Role: %s", user, role);
+                        } else {
+                            strcpy(response, "User not found");
+                        }
+                    
+                        sqlite3_finalize(stmt);
+                    }
+                
+                    sqlite3_close(main_db);
+                }
+
+                pthread_rwlock_unlock(&rwlock); // unlock lock
+            }
+        }
+
+        else if (strcmp(query_requested, "View_all_users") == 0) {
+            if(strcmp(user_role, "admin") != 0) {
+                sprintf(response, "%s", "NOT_ADMIN"); // Error code for the client, must be an admin for this query.
+                if ((bytes = SSL_write(ssl, response, strlen(response))) < 0) {
+                    fprintf(stderr, "Failed to write, Error: %s\n", strerror(errno));
+                    exit(EXIT_FAILURE);
+                }
+
+                bzero(response, BUFFER_SIZE); // reset the buffer
+            }
+            else {
+
+                pthread_rwlock_rdlock(&rwlock); // read lock
+
+                sqlite3 *main_db;
+                sqlite3_stmt *stmt;
+                int dbResult;
+            
+                dbResult = sqlite3_open(DATABASE_NAME, &main_db);
+                if (dbResult != SQLITE_OK) {
+                    strcpy(response, "Failed to open database");
+                } else {
+                    const char *sql = "SELECT Username, Role FROM Users;";
+                    dbResult = sqlite3_prepare_v2(main_db, sql, -1, &stmt, 0);
+
+                    if (dbResult != SQLITE_OK) {
+                        strcpy(response, "Failed to prepare statement\n");
+                        sqlite3_close(main_db);
+                    }
+                    else {
+                        while (sqlite3_step(stmt) == SQLITE_ROW) {
+                            const char *name = (const char *)sqlite3_column_text(stmt, 0);
+                            const char *role = (const char *)sqlite3_column_text(stmt, 1);
+
+                            sprintf(response, "%s %s", name, role);
+
+                             if ((bytes = SSL_write(ssl, response, strlen(response))) < 0) {
+                                fprintf(stderr, "Failed to write, Error: %s\n", strerror(errno));
+                                exit(EXIT_FAILURE);
+                             }
+
+                            bzero(response, BUFFER_SIZE); // reset the buffer after writing.
+                        }
+
+                        sprintf(response, "%s", "END_OF_QUERY"); // Code for client to use to know to stop reading.
+
+                        if ((bytes = SSL_write(ssl, response, strlen(response))) < 0) {
+                            fprintf(stderr, "Failed to write, Error: %s\n", strerror(errno));
+                            exit(EXIT_FAILURE);
+                        }
+
+                        bzero(response, BUFFER_SIZE); // reset the buffer after writing.
+                    }
+
+                    sqlite3_close(main_db);
+                }
+
+                pthread_rwlock_unlock(&rwlock); // unlock lock
+            }
+        }
+
+        else if (strcmp(query_requested, "Update_product") == 0) {
+            char product_name[STRING_SIZE];
+            char product_category[STRING_SIZE];
+            int product_quantity;
+            double product_price;
+            
+            sscanf(buffer, "%s %s %s %d %le", query_requested, product_name, product_category, &product_quantity, &product_price);
+            
+            pthread_rwlock_wrlock(&rwlock); // write lock
+
+            sqlite3 *main_db;
+            sqlite3_stmt *stmt;
+            int dbResult;
+            
+            dbResult = sqlite3_open(DATABASE_NAME, &main_db);
+            if (dbResult != SQLITE_OK) {
+                strcpy(response, "Failed to open database");
+            } else {
+                const char *update_product_sql = "UPDATE Products SET Category = ?, Quantity = ?, Price = ? WHERE ProductName = ?;";
+                dbResult = sqlite3_prepare_v2(main_db, update_product_sql, -1, &stmt, 0);
+                
+                if (dbResult != SQLITE_OK) {
+                    strcpy(response, "Failed to prepare statement");
+                } else {
+                    sqlite3_bind_text(stmt, 1, product_category, -1, SQLITE_STATIC);
+                    sqlite3_bind_int(stmt, 2, product_quantity);
+                    sqlite3_bind_double(stmt, 3, product_price);
+                    sqlite3_bind_text(stmt, 4, product_name, -1, SQLITE_STATIC);
+                    
+                    dbResult = sqlite3_step(stmt);
+                    
+                    if (dbResult == SQLITE_DONE) {
+                        if (sqlite3_changes(main_db) > 0) {
+                            strcpy(response, "Product updated successfully");
+                        } else {
+                            strcpy(response, "Product not found");
+                        }
+                    } else {
+                        strcpy(response, "Failed to update product");
+                    }
+                    
+                    sqlite3_finalize(stmt);
+                }
+                
+                sqlite3_close(main_db);
+            }
+
+            pthread_rwlock_unlock(&rwlock); // unlock lock
+        }
+
+        else if (strcmp(query_requested, "Add_product") == 0) {
+            char product_name[STRING_SIZE];
+            char product_category[STRING_SIZE];
+            int product_quantity;
+            double product_price;
+
+            sscanf(buffer, "%s %s %s %d %le", query_requested, product_name, product_category, &product_quantity, &product_price);
+            bool added_new_product = add_product_query(product_name, product_category, product_quantity, product_price);
+
+            if (added_new_product) {
+                strcpy(response, "Added the new product successfully\n");
+            }
+            else {
+                strcpy(response, "Failed to add the new product\n");
+            }
+        }
+
+        else if (strcmp(query_requested, "Delete_product") == 0) {
+            char product_name[STRING_SIZE];
+            sscanf(buffer, "%s %s", query_requested, product_name);
+            
+            pthread_rwlock_wrlock(&rwlock); // write lock
+
+            sqlite3 *main_db;
+            sqlite3_stmt *stmt;
+            int dbResult;
+            
+            dbResult = sqlite3_open(DATABASE_NAME, &main_db);
+            if (dbResult != SQLITE_OK) {
+                strcpy(response, "Failed to open database");
+            } else {
+                const char *delete_product_sql = "DELETE FROM Products WHERE ProductName = ?;";
+                dbResult = sqlite3_prepare_v2(main_db, delete_product_sql, -1, &stmt, 0);
+                
+                if (dbResult != SQLITE_OK) {
+                    strcpy(response, "Failed to prepare statement");
+                } else {
+                    sqlite3_bind_text(stmt, 1, product_name, -1, SQLITE_STATIC);
+                    dbResult = sqlite3_step(stmt);
+                    
+                    if (dbResult == SQLITE_DONE) {
+                        if (sqlite3_changes(main_db) > 0) {
+                            strcpy(response, "Product deleted successfully");
+                        } else {
+                            strcpy(response, "Product not found");
+                        }
+                    } else {
+                        strcpy(response, "Failed to delete product");
+                    }
+                    
+                    sqlite3_finalize(stmt);
+                }
+                
+                sqlite3_close(main_db);
+            }
+
+            pthread_rwlock_unlock(&rwlock); // unlock lock
+        }
+
+        else if (strcmp(query_requested, "View_product") == 0) {
+            char product_name[STRING_SIZE];
+            sscanf(buffer, "%s %s", query_requested, product_name);
+            
+            pthread_rwlock_rdlock(&rwlock); // read lock
+
+            sqlite3 *main_db;
+            sqlite3_stmt *stmt;
+            int dbResult;
+            
+            dbResult = sqlite3_open(DATABASE_NAME, &main_db);
+            if (dbResult != SQLITE_OK) {
+                strcpy(response, "Failed to open database");
+            } else {
+                const char *view_product_sql = "SELECT ProductName, Category, Quantity, Price FROM Products WHERE ProductName = ?;";
+                dbResult = sqlite3_prepare_v2(main_db, view_product_sql, -1, &stmt, 0);
+                
+                if (dbResult != SQLITE_OK) {
+                    strcpy(response, "Failed to prepare statement");
+                } else {
+                    sqlite3_bind_text(stmt, 1, product_name, -1, SQLITE_STATIC);
+                    dbResult = sqlite3_step(stmt);
+                    
+                    if (dbResult == SQLITE_ROW) {
+                        const char *name = (const char *)sqlite3_column_text(stmt, 0);
+                        const char *category = (const char *)sqlite3_column_text(stmt, 1);
+                        int quantity = sqlite3_column_int(stmt, 2);
+                        double price = sqlite3_column_double(stmt, 3);
+                        snprintf(response, BUFFER_SIZE, "Name: %s, Category: %s, Quantity: %d, Price: %.2f", name, category, quantity, price);
+                    } else {
+                        strcpy(response, "Product not found");
+                    }
+                    
+                    sqlite3_finalize(stmt);
+                }
+                
+                sqlite3_close(main_db);
+            }
+
+            pthread_rwlock_unlock(&rwlock); // unlock lock
+        }
+
+        else if (strcmp(query_requested, "View_all_products") == 0) {
+
+            pthread_rwlock_rdlock(&rwlock); // read lock
+
+            sqlite3 *main_db;
+            sqlite3_stmt *stmt;
+            int dbResult;
+            
+            dbResult = sqlite3_open(DATABASE_NAME, &main_db);
+            if (dbResult != SQLITE_OK) {
+                strcpy(response, "Failed to open database\n");
+            }
+            else {
+                const char *sql = "SELECT ProductName, Category, Quantity, Price FROM Products;";
+                dbResult = sqlite3_prepare_v2(main_db, sql, -1, &stmt, 0);
+
+                if (dbResult != SQLITE_OK) {
+                    strcpy(response, "Failed to prepare statement\n");
+                    sqlite3_close(main_db);
+                }
+                else {
+                    while (sqlite3_step(stmt) == SQLITE_ROW) {
+                        const char *name = (const char *)sqlite3_column_text(stmt, 0);
+                        const char *category = (const char *)sqlite3_column_text(stmt, 1);
+                        int quantity = sqlite3_column_int(stmt, 2);
+                        double price = sqlite3_column_double(stmt, 3);
+
+                        sprintf(response, "%s %s %d %f", name, category, quantity, price);
+
+                        if ((bytes = SSL_write(ssl, response, strlen(response))) < 0) {
+                            fprintf(stderr, "Failed to write, Error: %s\n", strerror(errno));
+                            exit(EXIT_FAILURE);
+                        }
+
+                        bzero(response, BUFFER_SIZE);
+                    }
+
+                    sprintf(response, "%s", "END_OF_QUERY");
+                    if ((bytes = SSL_write(ssl, response, strlen(response))) < 0) {
+                        fprintf(stderr, "Failed to write, Error: %s\n", strerror(errno));
+                        exit(EXIT_FAILURE);
+                    }
+
+                    bzero(response, BUFFER_SIZE);
+                }
+
+                sqlite3_close(main_db);
+            }   
+
+            pthread_rwlock_unlock(&rwlock); // unlock lock
+        }
+
+        else {
+            strcpy(response, "Server: Invalid Query, please try again");
+        }
+
+        if (strcmp(query_requested, "View_all_products") != 0 || strcmp(query_requested, "View_all_users") != 0) { // Writes are done within the related if statements, every other query will use this write call.
+            if ((bytes = SSL_write(ssl, response, strlen(response))) < 0) {
+                fprintf(stderr, "Failed to write or connection with client was closed/lost, if failure, Error is: %s\n", strerror(errno));
+                exit(EXIT_FAILURE);
+            }
+
+            bzero(response, BUFFER_SIZE); // Clear out the response/buffer for the next use.
+        }
+    }
+
+    free(user_role); // Deallocate memory.
+}
+
+int main(int argc, char **argv) {
+    SSL_CTX* ssl_ctx;
+    unsigned int sockfd;
+    unsigned int port = DEFAULT_PORT;
+
+    // Initialize OpenSSL
+    init_openssl();
+    ssl_ctx = create_new_context();
+    configure_context(ssl_ctx);
+
+    // Parse command line arguments for port
+    if (argc == 2) {
+        port = atoi(argv[1]);
+    }
+
+    if (!create_database()) {
+        printf("Server: Failed to initially set up the main db and/or tables.\n");
+        return EXIT_FAILURE;
+    }
+
+    // Create socket and start listening
+    sockfd = create_socket(port);
+
+    // Start replication thread
+    pthread_t repl_thread;
+    if (pthread_create(&repl_thread, NULL, replication_thread, NULL) != 0) {
+        fprintf(stderr, "Failed to create replication thread\n");
+        return EXIT_FAILURE;
+    }
+
+    // Main server loop
+    while(true) {
+        SSL* ssl;
+        int client;
+        struct sockaddr_in addr;
+        unsigned int len = sizeof(addr);
+        char client_addr[INET_ADDRSTRLEN];
+
+        // Accept incoming connection
+        client = accept(sockfd, (struct sockaddr*)&addr, &len);
+        if (client < 0) {
+            fprintf(stderr, "Server: Unable to accept connection: %s\n", strerror(errno));
+            continue;
+        }
+
+        // Get client's IP address
+        inet_ntop(AF_INET, &addr.sin_addr, client_addr, INET_ADDRSTRLEN);
+        printf("Server: Established TCP connection with client (%s) on port %u\n", client_addr, port);
+
+        // Create new SSL structure for this connection
+        ssl = SSL_new(ssl_ctx);
+        SSL_set_fd(ssl, client);
+
+        // Perform SSL handshake
+        if (SSL_accept(ssl) <= 0) {
+            fprintf(stderr, "Server: Could not establish secure connection:\n");
+            ERR_print_errors_fp(stderr);
+        } else {
+            printf("Server: Established SSL/TLS connection with client (%s)\n", client_addr);
+
+            // Fork a new process to handle the client
+            pid_t pid = fork();
+            if (pid == 0) {  // Child process
+                close(sockfd);  // Close listening socket in child
+                handle_client(ssl, client, client_addr);
+                SSL_free(ssl);
+                exit(EXIT_SUCCESS);
+            } else if (pid > 0) {  // Parent process
+                close(client);  // Close client socket in parent
+                SSL_free(ssl);
+            } else {
+                fprintf(stderr, "Fork failed\n");
+            }
+        }
+    }
+
+    // Clean up (this part is never reached in this implementation)
     SSL_CTX_free(ssl_ctx);
     cleanup_openssl();
     close(sockfd);
-    sqlite3_close(db);
 
     return EXIT_SUCCESS;
 }

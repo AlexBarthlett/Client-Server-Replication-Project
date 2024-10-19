@@ -2,7 +2,8 @@
  * @file enc-client.c
  * @author ** Alexander E Barthlett, Richard Disimoni **
  * @date  ** October 20, 2024 **
- * @brief fill in here
+ * @brief This program implements a client that securely communicates with the server over SSL.
+ *        The client can perform authenticated operations such as adding users/products, viewing, deleting, updating etc.
 */
 
 #include <netdb.h>
@@ -26,242 +27,429 @@
 
 #include <stdbool.h>
 
+// Constants for client configuration
 #define DEFAULT_PORT        4433
 #define DEFAULT_HOST        "localhost"
 #define MAX_HOSTNAME_LENGTH 256
-#define BUFFER_SIZE         256
-#define STRING_NAME         50
+#define BUFFER_SIZE         1024  // Increased to handle longer responses
+#define STRING_SIZE         50
+
+// Function prototypes
+int create_socket(char* hostname, unsigned int port);
+bool authenticate(SSL* ssl);
 
 /**
-* @brief This function does the basic necessary housekeeping to establish a secure TCP
-*        connection to the server specified by 'hostname'.
-*/
+ * Creates a socket and connects to the specified host and port.
+ */
 int create_socket(char* hostname, unsigned int port) {
-  int                sockfd;
-  struct hostent*    host;
-  struct sockaddr_in dest_addr;
+    int sockfd;
+    struct hostent* host;
+    struct sockaddr_in dest_addr;
 
-  host = gethostbyname(hostname);
-  if (host == NULL) {
-    fprintf(stderr, "Client: Cannot resolve hostname %s\n",  hostname);
-    exit(EXIT_FAILURE);
-  }
+    // Resolve the hostname to an IP address
+    host = gethostbyname(hostname);
+    if (host == NULL) {
+        fprintf(stderr, "Client: Cannot resolve hostname %s\n", hostname);
+        exit(EXIT_FAILURE);
+    }
 
-  // Create a socket (endpoint) for network communication.  The socket()
-  // call returns a socket descriptor, which works exactly like a file
-  // descriptor for file system operations we worked with in CS431
-  //
-  // Sockets are by default blocking, so the server will block while reading
-  // from or writing to a socket. For most applications this is acceptable.
-  sockfd = socket(AF_INET, SOCK_STREAM, 0);
-  if (sockfd < 0) {
-    fprintf(stderr, "Server: Unable to create socket: %s", strerror(errno));
-    exit(EXIT_FAILURE);
-  }
+    // Create a socket for IPv4 and TCP protocol
+    sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sockfd < 0) {
+        fprintf(stderr, "Client: Unable to create socket: %s", strerror(errno));
+        exit(EXIT_FAILURE);
+    }
 
-  // First we set up a network socket. An IP socket address is a combination
-  // of an IP interface address plus a 16-bit port number. The struct field
-  // sin_family is *always* set to AF_INET. Anything else returns an error.
-  // The TCP port is stored in sin_port, but needs to be converted to the
-  // format on the host machine to network byte order, which is why htons()
-  // is called. The s_addr field is the network address of the remote host
-  // specified on the command line. The earlier call to gethostbyname()
-  // retrieves the IP address for the given hostname.
-  dest_addr.sin_family=AF_INET;
-  dest_addr.sin_port=htons(port);
-  dest_addr.sin_addr.s_addr = *(long*)(host->h_addr);
+    // Prepare the sockaddr_in structure
+    dest_addr.sin_family = AF_INET;
+    dest_addr.sin_port = htons(port);
+    dest_addr.sin_addr.s_addr = *(long*)(host->h_addr);
 
-  // Now we connect to the remote host.  We pass the connect() system call the
-  // socket descriptor, the address of the remote host, and the size in bytes
-  // of the remote host's address
-  if (connect(sockfd, (struct sockaddr *) &dest_addr,
-	      sizeof(struct sockaddr)) <0) {
-    fprintf(stderr, "Client: Cannot connect to host %s [%s] on port %d: %s\n",
-	    hostname, inet_ntoa(dest_addr.sin_addr), port, strerror(errno));
-    exit(EXIT_FAILURE);
-  }
+    // Connect to the server
+    if (connect(sockfd, (struct sockaddr *) &dest_addr, sizeof(struct sockaddr)) < 0) {
+        fprintf(stderr, "Client: Cannot connect to host %s [%s] on port %d: %s\n",
+                hostname, inet_ntoa(dest_addr.sin_addr), port, strerror(errno));
+        exit(EXIT_FAILURE);
+    }
 
-  return sockfd;
+    return sockfd;
 }
-
-void logInCall() {
-    // if the LOG_IN message is received, call this function to loop, read and write until logged in or exit.
-}
-
-int exitFailureCall(SSL* ssl, SSL_CTX* ssl_ctx, int* sockfd, char* remote_host) {
-    printf("Client: Terminating SSL session and TCP connection with server (%s)\n",
-	    remote_host);
-    SSL_CTX_free(ssl_ctx);
-    SSL_shutdown(ssl);
-    SSL_free(ssl);
-    close(*sockfd);
-
-    return EXIT_FAILURE;
-}
-
 
 /**
-* @brief The sequence of steps required to establish a secure SSL/TLS connection is:
-*
-*        1.  Initialize the SSL algorithms
-*        2.  Create and configure an SSL context object
-*        3.  Create an SSL session object
-*        4.  Create a new network socket in the traditional way
-*        5.  Bind the SSL object to the network socket descriptor
-*        6.  Establish an SSL session on top of the network connection
-*
-* Once these steps are completed successfully, use the functions SSL_read() and
-* SSL_write() to read from/write to the socket, but using the SSL object rather
-* then the socket descriptor.  Once the session is complete, free the memory
-* allocated to the SSL object and close the socket descriptor.
-*/
-int main(int argc, char** argv) {
-  const SSL_METHOD* method;
-  unsigned int      port = DEFAULT_PORT;
-  char              remote_host[MAX_HOSTNAME_LENGTH];
-  char              buffer[BUFFER_SIZE];
-  char*             temp_ptr;
-  int               sockfd;
-  int               total = 0;
-  int               messageRead;
-  int               messageSent;
-  SSL_CTX*          ssl_ctx;
-  SSL*              ssl;
-  char              userResponse[STRING_NAME];
-  char              userName[STRING_NAME];
-  char              userPassword[STRING_NAME];
-
-  if (argc != 2) {
-    fprintf(stderr, "Client: Usage: ssl-client <server name>:<port>\n");
-    exit(EXIT_FAILURE);
-  } else {
-    // Search for ':' in the argument to see if port is specified
-    temp_ptr = strchr(argv[1], ':');
-    if (temp_ptr == NULL)    // Hostname only. Use default port
-      strncpy(remote_host, argv[1], MAX_HOSTNAME_LENGTH);
-    else {
-      // Argument is formatted as <hostname>:<port>. Need to separate
-      // First, split out the hostname from port, delineated with a colon
-      // remote_host will have the <hostname> substring
-      strncpy(remote_host, strtok(argv[1], ":"), MAX_HOSTNAME_LENGTH);
-      // Port number will be the substring after the ':'. At this point
-      // temp is a pointer to the array element containing the ':'
-      port = (unsigned int) atoi(temp_ptr+sizeof(char));
-    }
-  }
-
-  // Initialize OpenSSL ciphers and digests
-  OpenSSL_add_all_algorithms();
-
-  // SSL_library_init() registers the available SSL/TLS ciphers and digests.
-  if(SSL_library_init() < 0) {
-    fprintf(stderr, "Client: Could not initialize the OpenSSL library!\n");
-    exit(EXIT_FAILURE);
-  }
-
-  // Use the SSL/TLS method for clients
-  method = SSLv23_client_method();
-
-  // Create new context instance
-  ssl_ctx = SSL_CTX_new(method);
-  if (ssl_ctx == NULL) {
-    fprintf(stderr, "Unable to create a new SSL context structure.\n");
-    exit(EXIT_FAILURE);
-  }
-
-  // This disables SSLv2, which means only SSLv3 and TLSv1 are available
-  // to be negotiated between client and server
-  SSL_CTX_set_options(ssl_ctx, SSL_OP_NO_SSLv2);
-
-  // Create a new SSL connection state object
-  ssl = SSL_new(ssl_ctx);
-
-  // Create the underlying TCP socket connection to the remote host
-  sockfd = create_socket(remote_host, port);
-  if(sockfd != 0)
-    fprintf(stderr, "Client: Established TCP connection to '%s' on port %u\n", remote_host, port);
-  else {
-    fprintf(stderr, "Client: Could not establish TCP connection to %s on port %u\n", remote_host, port);
-    exit(EXIT_FAILURE);
-  }
-
-  // Bind the SSL object to the network socket descriptor. The socket descriptor
-  // will be used by OpenSSL to communicate with a server. This function should
-  // only be called once the TCP connection is established, i.e., after
-  // create_socket()
-  SSL_set_fd(ssl, sockfd);
-
-  // Initiates an SSL session over the existing socket connection. SSL_connect()
-  // will return 1 if successful.
-  if (SSL_connect(ssl) == 1)
-    printf("Client: Established SSL/TLS session to '%s' on port %u\n", remote_host, port);
-  else {
-    fprintf(stderr, "Client: Could not establish SSL session to '%s' on port %u\n", remote_host, port);
-    exit(EXIT_FAILURE);
-  }
-
-  //*************************************************************************
-  // YOUR CODE HERE
-  //
-  // You will need to use the SSL_read and SSL_write functions, which work in
-  // the same manner as traditional read and write system calls, but use the
-  // SSL socket descriptor ssl declared above instead of a file descriptor.
-  // ************************************************************************
-
-    bzero(buffer, BUFFER_SIZE);
-
-    if ((messageRead = SSL_read(ssl, buffer, BUFFER_SIZE)) < 0) {
-        fprintf(stderr, "Client: Failed to read the message from the server, Error: %s\n", strerror(errno));
-
-        return exitFailureCall(ssl, ssl_ctx, &sockfd, remote_host);
-    }
-
-    else {
+ * Authenticates the client with the server.
+ */
+bool authenticate(SSL* ssl) {
+    char buffer[BUFFER_SIZE];
+    int bytes;
     
-        printf("Client: Message Received, message: %s\n", buffer);
+    // Receive authentication request from server
+    bytes = SSL_read(ssl, buffer, sizeof(buffer));
+    if (bytes <= 0) {
+        fprintf(stderr, "Error receiving authentication request\n");
+        return false;
+    }
 
-        bzero(buffer, BUFFER_SIZE);
+    buffer[bytes] = 0;
+    printf("Server: %s\n", buffer);
+    
+    // Get username and password from user
+    char username[STRING_SIZE], password[STRING_SIZE];
+    printf("Enter username: ");
+    fgets(username, sizeof(username), stdin);
+    username[strcspn(username, "\n")] = 0;  // Remove newline
+    printf("Enter password: ");
+    fgets(password, sizeof(password), stdin);
+    password[strcspn(password, "\n")] = 0;  // Remove newline
+    
+    // Send credentials to server
+    char credentials[BUFFER_SIZE];
+    snprintf(credentials, sizeof(credentials), "%s %s", username, password);
 
-        if ((messageRead = SSL_read(ssl, buffer, BUFFER_SIZE)) < 0) {
-            fprintf(stderr, "Client: Failed to read the message from the server, Error: %s\n", strerror(errno));
+    if ((bytes = SSL_write(ssl, credentials, strlen(credentials))) < 0) {
+        fprintf(stderr, "Failed to write, Error: %s\n", strerror(errno));
+        return false;
+    }
+    
+    // Receive authentication result
+    bytes = SSL_read(ssl, buffer, sizeof(buffer));
+    if (bytes <= 0) {
+        fprintf(stderr, "Error receiving authentication result\n");
+        return false;
+    }
+    buffer[bytes] = 0;
+    printf("Server: %s\n", buffer);
+    
+    // Check if authentication was successful
+    return strstr(buffer, "successful") != NULL;
+}
 
-            return exitFailureCall(ssl, ssl_ctx, &sockfd, remote_host);
-        }
-        else {
-            fprintf(stdout, "Client: Message Received, message: %s\n", buffer);
+int main(int argc, char** argv) {
+    const SSL_METHOD* method;
+    unsigned int port = DEFAULT_PORT;
+    char remote_host[MAX_HOSTNAME_LENGTH];
+    char buffer[BUFFER_SIZE];
+    char* temp_ptr;
+    int sockfd;
+    SSL_CTX* ssl_ctx;
+    SSL* ssl;
 
-            if ((strcmp(buffer, "LOG_IN")) == 0) {
-                printf("Client: Please sign in:\n");
-                printf("Client: Username (email): ");
-                fgets(userName, STRING_NAME-1, stdin);
-                userName[strlen(userName)-1] = '\0';
-                printf("Client: Password: ");
-                fgets(userPassword, STRING_NAME-1, stdin);
-                userPassword[strlen(userPassword)-1] = '\0';
-
-                bzero(buffer, BUFFER_SIZE);
-                sprintf(buffer, "%s %s", userName, userPassword);
-
-                if ((messageSent = SSL_write(ssl, buffer, strlen(buffer))) < 0) {
-                    fprintf(stderr, "Client: Failed to send the message to the server, Error: %s\n", strerror(errno));
-                    
-                    return exitFailureCall(ssl, ssl_ctx, &sockfd, remote_host);
-                }
-
-                else {
-                    printf("Client: Successfully sent the log in message: %s\n", buffer);
-                }
-            } 
+    // Parse command line arguments
+    if (argc != 2) {
+        fprintf(stderr, "Client: Usage: ssl-client <server name>:<port>\n");
+        exit(EXIT_FAILURE);
+    } else {
+        // Check if port is specified in the argument
+        temp_ptr = strchr(argv[1], ':');
+        if (temp_ptr == NULL) {
+            // Only hostname provided, use default port
+            strncpy(remote_host, argv[1], MAX_HOSTNAME_LENGTH);
+        } else {
+            // Hostname and port provided
+            strncpy(remote_host, strtok(argv[1], ":"), MAX_HOSTNAME_LENGTH);
+            port = (unsigned int) atoi(temp_ptr + sizeof(char));
         }
     }
 
+    // Initialize OpenSSL
+    OpenSSL_add_all_algorithms();
+    if(SSL_library_init() < 0) {
+        fprintf(stderr, "Client: Could not initialize the OpenSSL library!\n");
+        exit(EXIT_FAILURE);
+    }
 
-  // Deallocate memory for the SSL data structures and close the socket
-  SSL_free(ssl);
-  SSL_CTX_free(ssl_ctx);
-  close(sockfd);
-  printf("Client: Terminated SSL/TLS connection with server '%s'\n",
-	 remote_host);
+    // Create new SSL connection state
+    method = SSLv23_client_method();
+    ssl_ctx = SSL_CTX_new(method);
+    if (ssl_ctx == NULL) {
+        fprintf(stderr, "Unable to create a new SSL context structure.\n");
+        exit(EXIT_FAILURE);
+    }
 
-  return EXIT_SUCCESS;
+    // Disallow SSLv2
+    SSL_CTX_set_options(ssl_ctx, SSL_OP_NO_SSLv2);
+
+    // Create new SSL connection state object
+    ssl = SSL_new(ssl_ctx);
+
+    // Create TCP connection
+    sockfd = create_socket(remote_host, port);
+    if(sockfd != 0) {
+        fprintf(stderr, "Client: Established TCP connection to '%s' on port %u\n", remote_host, port);
+    } else {
+        fprintf(stderr, "Client: Could not establish TCP connection to %s on port %u\n", remote_host, port);
+        exit(EXIT_FAILURE);
+    }
+
+    // Bind the SSL object to the socket descriptor
+    SSL_set_fd(ssl, sockfd);
+
+    // Perform SSL handshake
+    if (SSL_connect(ssl) == 1) {
+        printf("Client: Established SSL/TLS session to '%s' on port %u\n", remote_host, port);
+    } else {
+        fprintf(stderr, "Client: Could not establish SSL session to '%s' on port %u\n", remote_host, port);
+        exit(EXIT_FAILURE);
+    }
+
+    // Authenticate with the server
+    if (!authenticate(ssl)) {
+        fprintf(stderr, "Authentication failed. Exiting.\n");
+        SSL_free(ssl);
+        SSL_CTX_free(ssl_ctx);
+        close(sockfd);
+        return EXIT_FAILURE;
+    }
+
+    printf("Authentication successful. You can now send queries.\n");
+
+    // Main communication loop
+    while (1) {
+        bool incorrect_password = true;
+        char query[BUFFER_SIZE];
+        printf("Enter your query (or 'quit' to exit): ");
+        fgets(query, sizeof(query), stdin);
+        query[strcspn(query, "\n")] = 0;  // Remove newline
+
+        if (strcmp(query, "quit") == 0) break;
+
+        if (strcmp(query, "Add_user") == 0) {
+            char username[STRING_SIZE];
+            char password[STRING_SIZE];
+            char role[STRING_SIZE];
+
+            printf("Enter the new username: ");
+            fgets(username, sizeof(username), stdin);
+            username[strcspn(username, "\n")] = 0;
+            for (int i = 0; i < strlen(username); i++) { // Replaces all spaces to ensure a single string for marshalling.
+                if (username[i] == ' ') {
+                    username[i] = '_';
+                }
+            }
+
+            while (incorrect_password) {
+                printf("Enter a new password: ");
+                fgets(password, sizeof(password), stdin);
+                password[strcspn(password, "\n")] = 0;
+                for (int i = 0; i < strlen(password); i++) { // Passwords cant have spaces, check for spaces.
+                    if (password[i] == ' ') {
+                        printf("Error: Spaces are not allowed in the password\n");
+
+                        bzero(password, STRING_SIZE); // Clear buffer for next password.
+                        break;
+                    }
+                    else if (password[i] != ' ' && i == strlen(password) - 1) {
+                        incorrect_password = false; // No spaces, all good to break loop.
+                    }
+                }  
+            }
+
+            incorrect_password = true; // Reset back to true for the next use, may not be needed, but for robustness.
+
+            printf("Enter a new user role (admin or none): ");
+            fgets(role, sizeof(role), stdin);
+            role[strcspn(role, "\n")] = 0;
+            for (int i = 0; i < strlen(role); i++) { // Replaces all spaces to ensure a single string for marshalling.
+                if (role[i] == ' ') {
+                    role[i] = '_';
+                }
+            }
+
+            sprintf(query, "%s %s %s %s", "Add_user", username, password, role);
+        }
+        else if (strcmp(query, "Delete_user") == 0) {
+            char username[STRING_SIZE];
+            printf("Enter the username to delete: ");
+            fgets(username, sizeof(username), stdin);
+            username[strcspn(username, "\n")] = 0;
+
+            sprintf(query, "%s %s", "Delete_user", username);
+        }
+        else if (strcmp(query, "View_user") == 0) {
+            char username[STRING_SIZE];
+            printf("Enter the username to view: ");
+            fgets(username, sizeof(username), stdin);
+            username[strcspn(username, "\n")] = 0;
+
+            sprintf(query, "%s %s", "View_user", username);
+        }
+        else if (strcmp(query, "View_all_users") == 0) {
+            // No additional input needed
+        }
+        else if (strcmp(query, "Add_product") == 0) {
+            char product_name[STRING_SIZE];
+            char product_category[STRING_SIZE];
+            char temp_buffer[STRING_SIZE];
+            int product_quantity;
+            double product_price;
+
+            printf("Enter the new product's name: ");
+            fgets(product_name, sizeof(product_name), stdin);
+            product_name[strcspn(product_name, "\n")] = 0;
+            for (int i = 0; i < strlen(product_name); i++) { // Replaces all spaces to ensure a single string for marshalling.
+                if (product_name[i] == ' ') {
+                    product_name[i] = '_';
+                }
+            }
+
+            printf("Enter the new product's category: ");
+            fgets(product_category, sizeof(product_category), stdin);
+            product_category[strcspn(product_category, "\n")] = 0;
+            for (int i = 0; i < strlen(product_category); i++) { // Replaces all spaces to ensure a single string for marshalling.
+                if (product_category[i] == ' ') {
+                    product_category[i] = '_';
+                }
+            }
+
+            printf("Enter the new product's quantity: ");
+            fgets(temp_buffer, sizeof(temp_buffer), stdin);
+            temp_buffer[strcspn(temp_buffer, "\n")] = 0;
+            product_quantity = atoi(temp_buffer);
+
+            printf("Enter the new product's price: ");
+            fgets(temp_buffer, sizeof(temp_buffer), stdin);
+            temp_buffer[strcspn(temp_buffer, "\n")] = 0;
+            product_price = atof(temp_buffer);
+
+            sprintf(query, "%s %s %s %d %f", "Add_product", product_name, product_category, product_quantity, product_price);
+        }
+        else if (strcmp(query, "Update_product") == 0) {
+            char product_name[STRING_SIZE];
+            char product_category[STRING_SIZE];
+            char temp_buffer[STRING_SIZE];
+            int product_quantity;
+            double product_price;
+
+            printf("Enter the product's name to update: ");
+            fgets(product_name, sizeof(product_name), stdin);
+            product_name[strcspn(product_name, "\n")] = 0;
+
+            printf("Enter the new category: ");
+            fgets(product_category, sizeof(product_category), stdin);
+            product_category[strcspn(product_category, "\n")] = 0;
+            for (int i = 0; i < strlen(product_category); i++) { // Replaces all spaces to ensure a single string for marshalling.
+                if (product_category[i] == ' ') {
+                    product_category[i] = '_';
+                }
+            }
+
+            printf("Enter the new quantity: ");
+            fgets(temp_buffer, sizeof(temp_buffer), stdin);
+            temp_buffer[strcspn(temp_buffer, "\n")] = 0;
+            product_quantity = atoi(temp_buffer);
+
+            printf("Enter the new price: ");
+            fgets(temp_buffer, sizeof(temp_buffer), stdin);
+            temp_buffer[strcspn(temp_buffer, "\n")] = 0;
+            product_price = atof(temp_buffer);
+
+            sprintf(query, "%s %s %s %d %f", "Update_product", product_name, product_category, product_quantity, product_price);
+        }
+        else if (strcmp(query, "Delete_product") == 0) {
+            char product_name[STRING_SIZE];
+            printf("Enter the product name to delete: ");
+            fgets(product_name, sizeof(product_name), stdin);
+            product_name[strcspn(product_name, "\n")] = 0;
+
+            sprintf(query, "%s %s", "Delete_product", product_name);
+        }
+        else if (strcmp(query, "View_product") == 0) {
+            char product_name[STRING_SIZE];
+            printf("Enter the product name to view: ");
+            fgets(product_name, sizeof(product_name), stdin);
+            product_name[strcspn(product_name, "\n")] = 0;
+
+            sprintf(query, "%s %s", "View_product", product_name);
+        }
+        else if (strcmp(query, "View_all_products") == 0) {
+            // No additional input needed
+        }
+
+        int bytes_written = 0;
+        // Send query to server
+        if ((bytes_written = SSL_write(ssl, query, strlen(query))) < 0) {
+            fprintf(stderr, "Failed to write, Error: %s\n", strerror(errno));
+            return EXIT_FAILURE;
+        }
+
+        if (strcmp(query, "View_all_products") == 0) { // Needs to read multiple lines.
+            int bytes = 0;
+            while ((bytes = SSL_read(ssl, buffer, sizeof(buffer))) > 0) {
+                char endCheck[STRING_SIZE];
+                sscanf(buffer, "%s", endCheck);
+                if (strcmp(endCheck, "END_OF_QUERY") == 0) { // No more to read.
+                    break;
+                }
+                else {
+                    char name[STRING_SIZE];
+                    char category[STRING_SIZE];
+                    int quantity;
+                    double price;
+
+                    sscanf(buffer, "%s %s %d %le", name, category, &quantity, &price);
+                    printf("Name: %s, Category: %s, Quantity: %d, Price: %.2f\n", name, category, quantity, price);
+                }
+
+                bzero(buffer, BUFFER_SIZE); // Clear out for next read.
+            }
+
+            if ((bytes < 0)) {
+                fprintf(stderr, "Failed to read, Error: %s\n", strerror(errno));
+                return EXIT_FAILURE;
+            }
+
+            bzero(buffer, BUFFER_SIZE); // Clear out for next read.
+        }
+
+        else if(strcmp(query, "View_all_users") == 0) { // Needs to read multiple lines.
+            int bytes = 0;
+            while ((bytes = SSL_read(ssl, buffer, sizeof(buffer))) > 0) {
+                char endCheck[STRING_SIZE];
+                sscanf(buffer, "%s", endCheck);
+                if (strcmp(endCheck, "END_OF_QUERY") == 0) { // No more to read.
+                    break;
+                }
+                else if(strcmp(endCheck, "NOT_ADMIN") == 0) { // Not an admin, cant use this query.
+                    printf("Server Response: You do not have the proper role for that query\n");
+                    break;
+                }
+                else {
+                    char name[STRING_SIZE];
+                    char role[STRING_SIZE];
+
+                    sscanf(buffer, "%s %s", name, role);
+                    printf("Name: %s, Role: %s\n", name, role);
+                }
+
+                bzero(buffer, BUFFER_SIZE); // Clear out for next read.
+            }
+
+            if (bytes < 0) {
+                fprintf(stderr, "Failed to read, Error: %s\n", strerror(errno));
+                return EXIT_FAILURE;
+            }
+
+            bzero(buffer, BUFFER_SIZE); // Clear out for next read.
+        }
+
+        else { // Every other query only needs one read call.
+
+            // Receive and display server response
+            int bytes = SSL_read(ssl, buffer, sizeof(buffer));
+            if (bytes > 0) {
+                buffer[bytes] = 0;
+                printf("Server response: %s\n", buffer);
+            } else {
+                fprintf(stderr, "Error receiving server response\n");
+            }
+            bzero(buffer, BUFFER_SIZE);
+        }
+    }
+
+    // Clean up
+    SSL_free(ssl);
+    SSL_CTX_free(ssl_ctx);
+    close(sockfd);
+    printf("Client: Terminated SSL/TLS connection with server '%s'\n", remote_host);
+
+    return EXIT_SUCCESS;
 }
