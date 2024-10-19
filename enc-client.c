@@ -2,7 +2,8 @@
  * @file enc-client.c
  * @author ** Alexander E Barthlett, Richard Disimoni **
  * @date  ** October 20, 2024 **
- * @brief fill in here
+ * @brief This program implements a client that securely communicates with the server over SSL.
+ *        The client can perform authenticated operations such as adding users/products, viewing, deleting, updating etc.
 */
 
 #include <netdb.h>
@@ -87,6 +88,7 @@ bool authenticate(SSL* ssl) {
         fprintf(stderr, "Error receiving authentication request\n");
         return false;
     }
+
     buffer[bytes] = 0;
     printf("Server: %s\n", buffer);
     
@@ -102,7 +104,11 @@ bool authenticate(SSL* ssl) {
     // Send credentials to server
     char credentials[BUFFER_SIZE];
     snprintf(credentials, sizeof(credentials), "%s %s", username, password);
-    SSL_write(ssl, credentials, strlen(credentials));
+
+    if ((bytes = SSL_write(ssl, credentials, strlen(credentials))) < 0) {
+        fprintf(stderr, "Failed to write, Error: %s\n", strerror(errno));
+        return false;
+    }
     
     // Receive authentication result
     bytes = SSL_read(ssl, buffer, sizeof(buffer));
@@ -198,6 +204,7 @@ int main(int argc, char** argv) {
 
     // Main communication loop
     while (1) {
+        bool incorrect_password = true;
         char query[BUFFER_SIZE];
         printf("Enter your query (or 'quit' to exit): ");
         fgets(query, sizeof(query), stdin);
@@ -213,14 +220,39 @@ int main(int argc, char** argv) {
             printf("Enter the new username: ");
             fgets(username, sizeof(username), stdin);
             username[strcspn(username, "\n")] = 0;
+            for (int i = 0; i < strlen(username); i++) { // Replaces all spaces to ensure a single string for marshalling.
+                if (username[i] == ' ') {
+                    username[i] = '_';
+                }
+            }
 
-            printf("Enter a new password: ");
-            fgets(password, sizeof(password), stdin);
-            password[strcspn(password, "\n")] = 0;
+            while (incorrect_password) {
+                printf("Enter a new password: ");
+                fgets(password, sizeof(password), stdin);
+                password[strcspn(password, "\n")] = 0;
+                for (int i = 0; i < strlen(password); i++) { // Passwords cant have spaces, check for spaces.
+                    if (password[i] == ' ') {
+                        printf("Error: Spaces are not allowed in the password\n");
+
+                        bzero(password, STRING_SIZE); // Clear buffer for next password.
+                        break;
+                    }
+                    else if (password[i] != ' ' && i == strlen(password) - 1) {
+                        incorrect_password = false; // No spaces, all good to break loop.
+                    }
+                }  
+            }
+
+            incorrect_password = true; // Reset back to true for the next use, may not be needed, but for robustness.
 
             printf("Enter a new user role (admin or none): ");
             fgets(role, sizeof(role), stdin);
             role[strcspn(role, "\n")] = 0;
+            for (int i = 0; i < strlen(role); i++) { // Replaces all spaces to ensure a single string for marshalling.
+                if (role[i] == ' ') {
+                    role[i] = '_';
+                }
+            }
 
             sprintf(query, "%s %s %s %s", "Add_user", username, password, role);
         }
@@ -253,10 +285,20 @@ int main(int argc, char** argv) {
             printf("Enter the new product's name: ");
             fgets(product_name, sizeof(product_name), stdin);
             product_name[strcspn(product_name, "\n")] = 0;
+            for (int i = 0; i < strlen(product_name); i++) { // Replaces all spaces to ensure a single string for marshalling.
+                if (product_name[i] == ' ') {
+                    product_name[i] = '_';
+                }
+            }
 
             printf("Enter the new product's category: ");
             fgets(product_category, sizeof(product_category), stdin);
             product_category[strcspn(product_category, "\n")] = 0;
+            for (int i = 0; i < strlen(product_category); i++) { // Replaces all spaces to ensure a single string for marshalling.
+                if (product_category[i] == ' ') {
+                    product_category[i] = '_';
+                }
+            }
 
             printf("Enter the new product's quantity: ");
             fgets(temp_buffer, sizeof(temp_buffer), stdin);
@@ -284,6 +326,11 @@ int main(int argc, char** argv) {
             printf("Enter the new category: ");
             fgets(product_category, sizeof(product_category), stdin);
             product_category[strcspn(product_category, "\n")] = 0;
+            for (int i = 0; i < strlen(product_category); i++) { // Replaces all spaces to ensure a single string for marshalling.
+                if (product_category[i] == ' ') {
+                    product_category[i] = '_';
+                }
+            }
 
             printf("Enter the new quantity: ");
             fgets(temp_buffer, sizeof(temp_buffer), stdin);
@@ -317,16 +364,84 @@ int main(int argc, char** argv) {
             // No additional input needed
         }
 
+        int bytes_written = 0;
         // Send query to server
-        SSL_write(ssl, query, strlen(query));
+        if ((bytes_written = SSL_write(ssl, query, strlen(query))) < 0) {
+            fprintf(stderr, "Failed to write, Error: %s\n", strerror(errno));
+            return EXIT_FAILURE;
+        }
 
-        // Receive and display server response
-        int bytes = SSL_read(ssl, buffer, sizeof(buffer));
-        if (bytes > 0) {
-            buffer[bytes] = 0;
-            printf("Server response: %s\n", buffer);
-        } else {
-            fprintf(stderr, "Error receiving server response\n");
+        if (strcmp(query, "View_all_products") == 0) { // Needs to read multiple lines.
+            int bytes = 0;
+            while ((bytes = SSL_read(ssl, buffer, sizeof(buffer))) > 0) {
+                char endCheck[STRING_SIZE];
+                sscanf(buffer, "%s", endCheck);
+                if (strcmp(endCheck, "END_OF_QUERY") == 0) { // No more to read.
+                    break;
+                }
+                else {
+                    char name[STRING_SIZE];
+                    char category[STRING_SIZE];
+                    int quantity;
+                    double price;
+
+                    sscanf(buffer, "%s %s %d %le", name, category, &quantity, &price);
+                    printf("Name: %s, Category: %s, Quantity: %d, Price: %.2f\n", name, category, quantity, price);
+                }
+
+                bzero(buffer, BUFFER_SIZE); // Clear out for next read.
+            }
+
+            if ((bytes < 0)) {
+                fprintf(stderr, "Failed to read, Error: %s\n", strerror(errno));
+                return EXIT_FAILURE;
+            }
+
+            bzero(buffer, BUFFER_SIZE); // Clear out for next read.
+        }
+
+        else if(strcmp(query, "View_all_users") == 0) { // Needs to read multiple lines.
+            int bytes = 0;
+            while ((bytes = SSL_read(ssl, buffer, sizeof(buffer))) > 0) {
+                char endCheck[STRING_SIZE];
+                sscanf(buffer, "%s", endCheck);
+                if (strcmp(endCheck, "END_OF_QUERY") == 0) { // No more to read.
+                    break;
+                }
+                else if(strcmp(endCheck, "NOT_ADMIN") == 0) { // Not an admin, cant use this query.
+                    printf("Server Response: You do not have the proper role for that query\n");
+                    break;
+                }
+                else {
+                    char name[STRING_SIZE];
+                    char role[STRING_SIZE];
+
+                    sscanf(buffer, "%s %s", name, role);
+                    printf("Name: %s, Role: %s\n", name, role);
+                }
+
+                bzero(buffer, BUFFER_SIZE); // Clear out for next read.
+            }
+
+            if (bytes < 0) {
+                fprintf(stderr, "Failed to read, Error: %s\n", strerror(errno));
+                return EXIT_FAILURE;
+            }
+
+            bzero(buffer, BUFFER_SIZE); // Clear out for next read.
+        }
+
+        else { // Every other query only needs one read call.
+
+            // Receive and display server response
+            int bytes = SSL_read(ssl, buffer, sizeof(buffer));
+            if (bytes > 0) {
+                buffer[bytes] = 0;
+                printf("Server response: %s\n", buffer);
+            } else {
+                fprintf(stderr, "Error receiving server response\n");
+            }
+            bzero(buffer, BUFFER_SIZE);
         }
     }
 
