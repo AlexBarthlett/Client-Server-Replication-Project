@@ -23,4 +23,4 @@ Sign in using the admin account:
 User: test@regis.edu
 Password: TestP@ss
 
-Use the prompts given to alter the database and to create new accounts such as none admin related accounts.
+Use the prompts given to alter the database and to create new accounts such as non-admin related accounts.
